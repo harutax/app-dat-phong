@@ -1,0 +1,211 @@
+name: datphong-local
+# Moi truong DEV/local: mat khau/secret ben duoi chi la gia tri mac dinh cho may ca nhan.
+# Muon doi: dat bien trong file .env (xem .env.example). KHONG dung cac gia tri nay o moi truong that.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: datphong-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-datphong}
+      POSTGRES_USER: ${POSTGRES_USER:-datphong}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datphong_local_2026}
+      # init-fakebank-db.sh chay trong container nay nen can biet mat khau DB cua Fake Bank
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-fakebank_local_2026}
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - datphong_postgres_data:/var/lib/postgresql/data
+      - ./ops/init-fakebank-db.sh:/docker-entrypoint-initdb.d/init-fakebank-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-datphong} -d ${POSTGRES_DB:-datphong}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Redis — cache tim kiem/thong ke, rate limit. Chi de tang toc: loi Redis khong lam sai ton kho
+  # (PostgreSQL moi la nguon dung dan).
+  redis:
+    image: redis:7-alpine
+    container_name: datphong-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # MinIO — luu anh property/phong (presigned URL), metadata nam o PostgreSQL.
+  minio:
+    image: minio/minio:latest
+    container_name: datphong-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-datphong}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-datphong_local_2026}
+    ports:
+      - "127.0.0.1:${MINIO_API_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - datphong_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Tao bucket mot lan roi thoat.
+  minio-init:
+    image: minio/mc:latest
+    container_name: datphong-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-datphong} ${MINIO_SECRET_KEY:-datphong_local_2026} &&
+      mc mb -p local/${MINIO_BUCKET:-datphong}"
+
+  # Mailpit — SMTP gia lap, xem email o http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: datphong-mailpit
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_HOST_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_HOST_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Fake Bank — service DOC LAP (DB rieng, so cai kep, webhook). Chi la tien gia lap.
+  fake-bank:
+    build: ./fake-bank
+    container_name: datphong-fake-bank
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BANK_DB_HOST: postgres
+      BANK_DB_NAME: fakebank
+      BANK_DB_USER: fakebank
+      BANK_DB_PASSWORD: ${BANK_DB_PASSWORD:-fakebank_local_2026}
+      FAKE_BANK_SERVICE_SECRET: ${FAKE_BANK_SERVICE_SECRET:-datphong_local_bank_service_secret_2026}
+      FAKE_BANK_WEBHOOK_SECRET: ${FAKE_BANK_WEBHOOK_SECRET:-datphong_local_bank_webhook_secret_2026}
+      BANK_ADMIN_TOKEN: ${BANK_ADMIN_TOKEN:-datphong_local_bank_admin_2026}
+      BOOKING_WEBHOOK_URL: http://app:8080/api/v1/payments/fakebank/webhook
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "127.0.0.1:${FAKE_BANK_HOST_PORT:-8082}:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # Backend dat phong.
+  app:
+    build: ./app-dat-phong
+    container_name: datphong-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+      fake-bank:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-datphong}
+      POSTGRES_USER: ${POSTGRES_USER:-datphong}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datphong_local_2026}
+      REDIS_HOST: redis
+      MINIO_URL: http://minio:9000
+      MINIO_PUBLIC_URL: http://localhost:${MINIO_API_HOST_PORT:-9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-datphong}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-datphong_local_2026}
+      MINIO_BUCKET: ${MINIO_BUCKET:-datphong}
+      MAIL_HOST: mailpit
+      MAIL_PORT: 1025
+      JWT_SECRET: ${JWT_SECRET:-iovqQ+FFEoxD+vCQZCmkKi9rIDAIqGD3mF+yFntUM47FQNNrHILijv6sc4oWbiFY}
+      VERIFICATION_SECRET: ${VERIFICATION_SECRET:-datphong_local_verification_secret_2026}
+      FAKE_BANK_BASE_URL: http://fake-bank:8082
+      FAKE_BANK_SERVICE_SECRET: ${FAKE_BANK_SERVICE_SECRET:-datphong_local_bank_service_secret_2026}
+      FAKE_BANK_WEBHOOK_SECRET: ${FAKE_BANK_WEBHOOK_SECRET:-datphong_local_bank_webhook_secret_2026}
+      METRICS_TOKEN: ${METRICS_TOKEN:-datphong_local_metrics_2026}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      SEED_PASSWORD: ${SEED_PASSWORD:-ChangeMe@12345}
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v1/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  # Prometheus — scrape /api/v1/actuator/prometheus (can header X-Metrics-Token).
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: datphong-prometheus
+    restart: unless-stopped
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-datphong_local_metrics_2026}
+    # Prometheus KHONG expand bien moi truong trong http_headers -> ghi token ra file luc khoi dong roi doc bang files:
+    entrypoint: ["/bin/sh", "-c", "printf '%s' \"$$METRICS_TOKEN\" > /tmp/metrics_token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: datphong-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-datphong_local_2026}
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  datphong_postgres_data:
+  datphong_minio_data:

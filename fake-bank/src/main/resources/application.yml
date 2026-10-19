@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: fake-bank
+  datasource:
+    url: jdbc:postgresql://${BANK_DB_HOST:localhost}:${BANK_DB_PORT:5432}/${BANK_DB_NAME:fakebank}
+    username: ${BANK_DB_USER:fakebank}
+    password: ${BANK_DB_PASSWORD:fakebank}
+  flyway:
+    enabled: true
+  task:
+    scheduling:
+      pool:
+        size: 2
+server:
+  port: ${BANK_PORT:8082}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+bank:
+  # HMAC booking -> bank (ký request) và bank -> booking (ký webhook). Secret từ biến môi trường.
+  service-secret: ${FAKE_BANK_SERVICE_SECRET}
+  webhook-secret: ${FAKE_BANK_WEBHOOK_SECRET}
+  webhook-url: ${BOOKING_WEBHOOK_URL:http://localhost:8080/api/v1/payments/fakebank/webhook}
+  admin-token: ${BANK_ADMIN_TOKEN}
+  merchant-id: ${FAKE_BANK_MERCHANT_ID:datphong}
+  replay-window-seconds: 300
+  timeout-scenario-delay-ms: 7000     # TIMEOUT_AFTER_DEBIT: đã trừ tiền nhưng phản hồi quá chậm
+  delayed-callback-seconds: 25

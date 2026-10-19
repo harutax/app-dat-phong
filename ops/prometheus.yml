@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: app-dat-phong
+    metrics_path: /api/v1/actuator/prometheus
+    http_headers:
+      X-Metrics-Token:
+        values: ["${METRICS_TOKEN}"]
+    static_configs:
+      - targets: ["app:8080"]

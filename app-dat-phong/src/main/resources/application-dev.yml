@@ -1,0 +1,6 @@
+logging:
+  level:
+    datphong.vn: DEBUG
+app:
+  seed:
+    enabled: ${SEED_DEMO_DATA:true}

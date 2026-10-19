@@ -1,0 +1,119 @@
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 6      # nhiều job nền chạy song song
+  application:
+    name: app-dat-phong
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:datphong}
+    username: ${POSTGRES_USER:datphong}
+    password: ${POSTGRES_PASSWORD:datphong}
+    hikari:
+      pool-name: DatPhongHikariPool
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 2
+      connection-timeout: 5000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: ${JPA_DDL_AUTO:validate}
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 50
+        order_inserts: true
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 1500ms
+  mail:
+    host: ${MAIL_HOST:localhost}
+    port: ${MAIL_PORT:1025}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 8000
+      mail.smtp.writetimeout: 8000
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      fail-on-unknown-properties: false   # DTO không nhận trường lạ nên không bị mass assignment
+
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    context-path: /api/v1
+  error:
+    include-stacktrace: never
+    include-message: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    tags:
+      application: app-dat-phong   # KHÔNG gắn userId/bookingId vào tag (cardinality)
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+minio:
+  url: ${MINIO_URL:http://localhost:9000}
+  public-url: ${MINIO_PUBLIC_URL:http://localhost:9000}
+  access-key: ${MINIO_ACCESS_KEY:minioadmin}
+  secret-key: ${MINIO_SECRET_KEY:minioadmin}
+  bucket: ${MINIO_BUCKET:datphong}
+
+jwt:
+  secret: ${JWT_SECRET}            # base64 của >= 32 bytes:  openssl rand -base64 48
+  access-token-expiration: ${JWT_ACCESS_TOKEN_EXPIRATION:900000}
+  refresh-token-expiration: ${JWT_REFRESH_TOKEN_EXPIRATION:604800000}
+  max-active-refresh-tokens-per-user: ${JWT_MAX_ACTIVE_REFRESH_TOKENS:5}
+  issuer: ${JWT_ISSUER:app-dat-phong}
+
+app:
+  default-timezone: Asia/Ho_Chi_Minh
+  public-base-url: ${APP_PUBLIC_BASE_URL:http://localhost:3000}
+  verification-secret: ${VERIFICATION_SECRET}   # HMAC băm mã xác minh email
+  metrics-token: ${METRICS_TOKEN:}               # Prometheus gửi header X-Metrics-Token
+  redis-prefix: "datphong:"
+  scheduler:
+    enabled: ${SCHEDULER_ENABLED:true}
+    expiry-fixed-delay-ms: ${EXPIRY_JOB_DELAY_MS:15000}
+  mail:
+    enabled: ${MAIL_ENABLED:true}
+    from: ${MAIL_FROM:no-reply@datphong.local}
+  fake-bank:
+    base-url: ${FAKE_BANK_BASE_URL:http://localhost:8082}
+    merchant-id: ${FAKE_BANK_MERCHANT_ID:datphong}
+    service-secret: ${FAKE_BANK_SERVICE_SECRET}    # HMAC ký request booking -> bank
+    webhook-secret: ${FAKE_BANK_WEBHOOK_SECRET}    # HMAC bank ký webhook -> booking
+    webhook-replay-window-seconds: 300
+    http-timeout-ms: ${FAKE_BANK_TIMEOUT_MS:4000}
+  seed:
+    enabled: ${SEED_DEMO_DATA:false}
+    password: ${SEED_PASSWORD:ChangeMe@12345}
+
+logging:
+  level:
+    root: INFO
+    datphong.vn: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    level: "%5p [trace=%X{traceId:-}]"
