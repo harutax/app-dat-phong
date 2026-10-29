@@ -36,6 +36,15 @@ docker compose up --build
   một cơ sở demo ở Hà Nội với 2 loại phòng, 5 phòng, giá 180 ngày.
 - Prometheus scrape cần header `X-Metrics-Token` (actuator không public).
 
+### Chạy app từ IDE (IntelliJ) trên hạ tầng docker compose
+1. `docker compose up -d` (hạ tầng; container `app` có thể để chạy song song hoặc dừng).
+2. Run configuration `DatPhongApplication` → **Active profiles: `dev,local`**. Profile `local`
+   (`application-local.yml`) cấp sẵn secret/mật khẩu mặc định trùng docker-compose và chạy ở cổng **8090**.
+3. Postgres của compose mặc định publish ở 5432; nếu máy đã có PostgreSQL ở 5432, đặt `POSTGRES_HOST_PORT=5436`
+   trong `.env` (profile `local` mặc định nối cổng 5436, đổi bằng biến `POSTGRES_PORT`).
+- Webhook Fake Bank luôn gửi về container `app` (dùng chung DB nên vẫn áp đúng kết quả); nếu đã dừng container `app`,
+  thanh toán khởi tạo từ IDE được hoàn tất qua job đối soát.
+
 ### Tài khoản Fake Bank để thử kịch bản (gửi trong `payerAccount` của `POST /payments`)
 | Tài khoản | Hành vi |
 |---|---|

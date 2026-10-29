@@ -1,0 +1,29 @@
+# Profile "local": chạy app từ IDE (IntelliJ) và dùng hạ tầng đang chạy bằng docker compose
+# (postgres, redis, minio, mailpit, fake-bank). Bật bằng Active profiles = dev,local.
+# Giá trị dưới đây CHỈ là secret mặc định cho máy cá nhân, trùng với docker-compose.yml - KHÔNG dùng ở môi trường thật.
+# Biến môi trường (nếu đặt) vẫn được ưu tiên.
+
+server:
+  # 8080 đã do container datphong-app dùng; dừng container đó nếu muốn chạy IDE ở 8080
+  port: ${SERVER_PORT:8090}
+
+spring:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5436}/${POSTGRES_DB:datphong}
+    username: ${POSTGRES_USER:datphong}
+    password: ${POSTGRES_PASSWORD:datphong_local_2026}
+
+minio:
+  access-key: ${MINIO_ACCESS_KEY:datphong}
+  secret-key: ${MINIO_SECRET_KEY:datphong_local_2026}
+
+jwt:
+  secret: ${JWT_SECRET:iovqQ+FFEoxD+vCQZCmkKi9rIDAIqGD3mF+yFntUM47FQNNrHILijv6sc4oWbiFY}
+
+app:
+  verification-secret: ${VERIFICATION_SECRET:datphong_local_verification_secret_2026}
+  metrics-token: ${METRICS_TOKEN:datphong_local_metrics_2026}
+  fake-bank:
+    base-url: ${FAKE_BANK_BASE_URL:http://localhost:8082}
+    service-secret: ${FAKE_BANK_SERVICE_SECRET:datphong_local_bank_service_secret_2026}
+    webhook-secret: ${FAKE_BANK_WEBHOOK_SECRET:datphong_local_bank_webhook_secret_2026}

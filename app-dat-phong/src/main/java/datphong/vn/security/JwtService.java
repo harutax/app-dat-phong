@@ -28,7 +28,17 @@ public class JwtService {
     public JwtService(JwtProperties props, Clock clock) {
         this.props = props;
         this.clock = clock;
-        byte[] bytes = Decoders.BASE64.decode(props.getSecret());
+        String secret = props.getSecret();
+        if (secret == null || secret.isBlank() || secret.startsWith("${")) {
+            throw new IllegalStateException("Chưa cấu hình JWT_SECRET (base64 của >= 32 bytes, vd: openssl rand -base64 48). "
+                    + "Chạy từ IDE: bật profile 'local' hoặc đặt biến môi trường JWT_SECRET");
+        }
+        byte[] bytes;
+        try {
+            bytes = Decoders.BASE64.decode(secret);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("JWT_SECRET không phải base64 hợp lệ: " + e.getMessage(), e);
+        }
         if (bytes.length < 32) throw new IllegalStateException("JWT_SECRET phải là base64 của >= 32 bytes");
         this.key = Keys.hmacShaKeyFor(bytes);
     }
