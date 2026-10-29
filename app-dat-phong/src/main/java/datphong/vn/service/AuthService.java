@@ -153,8 +153,9 @@ public class AuthService {
         User u = users.findWithAuthoritiesByEmail(email).orElse(null);
         Instant now = clock.instant();
         if (u == null) {
-            encoder.matches(req.password(), "$2a$11$0000000000000000000000000000000000000000000000000000"); // làm đều thời gian
+            encoder.matches(req.password(), dummyHash()); // làm đều thời gian (hash BCrypt hợp lệ, cùng cost) -> không lộ email tồn tại
             log.info("login failure (unknown email) ip={}", ip);
+            audit.record("LOGIN_FAILURE", "USER", null, null, null, "UNKNOWN_EMAIL", Map.of("ip", String.valueOf(ip)));
             throw new BusinessException(ErrorCode.UNAUTHORIZED, "Thông tin đăng nhập không chính xác");
         }
         if (u.getLockedUntil() != null && u.getLockedUntil().isAfter(now)) {
@@ -167,6 +168,7 @@ public class AuthService {
                 u.setFailedLoginCount(0);
             }
             log.info("login failure userId={} ip={}", u.getId(), ip);
+            audit.record("LOGIN_FAILURE", "USER", u.getId(), null, null, "BAD_CREDENTIALS", Map.of("ip", String.valueOf(ip)));
             throw new BusinessException(ErrorCode.UNAUTHORIZED, "Thông tin đăng nhập không chính xác");
         }
         if (u.getStatus() == UserStatus.PENDING_VERIFICATION) {
@@ -178,6 +180,7 @@ public class AuthService {
         u.setFailedLoginCount(0);
         u.setLockedUntil(null);
         log.info("login success userId={} traceId={}", u.getId(), MDC.get("traceId"));
+        audit.record("LOGIN_SUCCESS", "USER", u.getId(), null, null, null, Map.of("ip", String.valueOf(ip)));
         return issueTokens(u, Texts.uuid(), device);
     }
 
@@ -218,6 +221,19 @@ public class AuthService {
             u.setTokenVersion(u.getTokenVersion() + 1);   // access token đang sống bị từ chối ngay
             refreshTokens.revokeAllForUser(userId, now);
         }
+        audit.record("LOGOUT", "USER", userId, null, null, null, Map.of("allDevices", req.allDevices()));
+    }
+
+    private volatile String dummyHash;
+
+    /** Hash BCrypt hợp lệ (tính một lần) để so khớp giả khi email không tồn tại: cùng chi phí với hash thật. */
+    private String dummyHash() {
+        String h = dummyHash;
+        if (h == null) {
+            h = encoder.encode(Texts.randomToken(24));
+            dummyHash = h;
+        }
+        return h;
     }
 
     private AuthResponses.Tokens issueTokens(User u, String familyId, String device) {

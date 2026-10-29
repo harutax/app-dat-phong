@@ -1,4 +1,4 @@
-﻿package datphong.vn.config;
+package datphong.vn.config;
 
 import datphong.vn.constant.*;
 import datphong.vn.exception.entity.*;

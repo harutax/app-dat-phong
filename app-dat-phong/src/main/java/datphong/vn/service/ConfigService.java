@@ -47,7 +47,13 @@ public class ConfigService {
         Instant now = clock.instant();
         defs.findAll().forEach(d -> m.put(d.getKey(), d.getDefaultValue()));
         values.findAll().forEach(v -> {
-            if (v.getScope().equals("GLOBAL") && !v.getEffectiveAt().isAfter(now)) m.put(v.getKey(), v.getValue());
+            if (!v.getScope().equals("GLOBAL")) return;
+            if (!v.getEffectiveAt().isAfter(now)) {
+                m.put(v.getKey(), v.getValue());
+            } else if (v.getPreviousValue() != null) {
+                // giá trị mới lên lịch cho tương lai: tới lúc đó vẫn dùng giá trị đang hiệu lực trước đây (không rơi về default)
+                m.put(v.getKey(), v.getPreviousValue());
+            }
         });
         this.cache = m;
         this.loadedAtMs = System.currentTimeMillis();
@@ -106,6 +112,7 @@ public class ConfigService {
 
         Map<String, String> merged = new HashMap<>(snapshot());
         for (var e : changes.entrySet()) {
+            if (e.getValue() == null) throw BusinessException.validation("Giá trị không được rỗng: " + e.getKey());
             ConfigDefinition d = defs.findByKey(e.getKey())
                     .orElseThrow(() -> BusinessException.validation("Khóa cấu hình không tồn tại: " + e.getKey()));
             validate(d, e.getValue());
@@ -118,7 +125,13 @@ public class ConfigService {
 
         for (var e : changes.entrySet()) {
             ConfigValue v = values.findByKeyAndScopeAndScopeId(e.getKey(), "GLOBAL", "").orElse(null);
-            String old = v == null ? defs.findByKey(e.getKey()).get().getDefaultValue() : v.getValue();
+            String def = defs.findByKey(e.getKey()).get().getDefaultValue();
+            // giá trị ĐANG hiệu lực tại thời điểm ghi (bản ghi cũ có thể còn đang chờ effective_at ở tương lai)
+            String effectiveNow;
+            if (v == null) effectiveNow = def;
+            else if (!v.getEffectiveAt().isAfter(clock.instant())) effectiveNow = v.getValue();
+            else effectiveNow = v.getPreviousValue() == null ? def : v.getPreviousValue();
+            String old = effectiveNow;
             if (v == null) {
                 v = new ConfigValue();
                 v.setKey(e.getKey());
@@ -126,6 +139,7 @@ public class ConfigService {
             } else {
                 v.setVersion(v.getVersion() + 1);
             }
+            v.setPreviousValue(effectiveNow);
             v.setValue(e.getValue());
             v.setEffectiveAt(eff);
             v.setUpdatedBy(actorId);

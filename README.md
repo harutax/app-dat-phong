@@ -20,7 +20,9 @@ hotel/
 | Flyway SQL (schema, exclusion constraint) | **Chưa chạy trên PostgreSQL** |
 | `BookingConcurrencyIT` (50 request đồng thời, idempotency, callback muộn…) | Đã viết, **chưa chạy** (cần Docker) |
 
-Lần đầu: `cd app-dat-phong && mvn -q verify`. `spring.jpa.hibernate.ddl-auto=validate` sẽ chỉ ra ngay cột/kiểu nào lệch giữa entity và `V1__init_schema.sql`.
+Lần đầu: `cd app-dat-phong && mvn -q verify`.
+
+> **Lần rà soát theo tài liệu đặc tả use case (UC-01..UC-36):** đã sửa các lỗi liệt kê trong `BAO_CAO_SUA_LOI.md` (kèm migration `V3__usecase_fixes.sql`). Môi trường rà soát không truy cập được Maven Central nên vẫn **chưa build Maven**; 22 unit test domain chạy lại vẫn pass, toàn bộ mã nguồn đã qua bước parse của `javac` và đối chiếu ánh xạ entity ↔ `V1__init_schema.sql`. `spring.jpa.hibernate.ddl-auto=validate` sẽ chỉ ra ngay cột/kiểu nào lệch giữa entity và `V1__init_schema.sql`.
 
 ## Chạy
 
@@ -74,16 +76,16 @@ docker compose up --build
 | 06 | Ảnh MinIO: presigned PUT, finalize (HEAD + magic bytes), dọn mồ côi | ✅ | Endpoint nằm dưới `/host/media/*` (đặc tả: `/media/*`) |
 | 07–08 | Tìm kiếm (SQL động, bind param, sort whitelist, cache), chi tiết, báo giá | ✅ | |
 | 09 | Booking + hold: lock + exclusion + idempotency + retry lock, snapshot giá/chính sách | ✅ | |
-| 10, 35, 36 | Thanh toán Fake Bank, webhook HMAC, UNKNOWN, đối soát, bù trừ | ✅ | `payment_intents` gộp vào `payments` (`intent_code`) |
+| 10, 35, 36 | Thanh toán Fake Bank, webhook HMAC, UNKNOWN, đối soát, bù trừ | ✅ | `payment_intents` gộp vào `payments` (`intent_code`); SUPPORT: `POST /support/payments/{id}/reconcile`, `POST /support/reconciliation-cases/{id}/compensate` |
 | 11 | Hết hạn giữ chỗ (SKIP LOCKED, recheck, giải phóng một lần) | ✅ | |
 | 12–13 | Hủy + phí, refund saga, đối soát, ca `NEEDS_ATTENTION` | ✅ | Hủy khi `CHECKED_IN` chỉ SUPPORT |
-| 14–15, 29 | Host xử lý booking, check-in/out, no-show, đề nghị giờ check-in | ✅ | Check-out ngoại lệ (chưa check-in) bởi SUPPORT: ❌ |
+| 14–15, 29 | Host xử lý booking, check-in/out, no-show, đề nghị giờ check-in | ✅ | Check-out ngoại lệ (chưa check-in) bởi SUPPORT: `POST /support/bookings/{id}/force-checkout` (quyền `SUPPORT_STAY_EXCEPTION`, lý do + audit); tra cứu lịch hẹn `GET /bookings/{id}/checkin-requests` |
 | 16 | Review, phản hồi host, kiểm duyệt có audit | ✅ | |
 | 17 | Outbox + notification | ✅ | |
-| 18, 21–25 | Dashboard, đa chiều, doanh thu/dòng tiền (aggregate **riêng** từng grain), công suất (date spine), funnel | ✅ 🟡 | Tính trực tiếp SQL + cache Redis; **chưa có bảng fact theo ngày** |
+| 18, 21–25 | Dashboard, đa chiều, doanh thu/dòng tiền (aggregate **riêng** từng grain), công suất (date spine), funnel | ✅ 🟡 | Kỳ báo cáo theo múi giờ cơ sở; HOST hỏi property ngoài phạm vi -> `FORBIDDEN_SCOPE`; `GET /analytics/cashflow` (UC-23); công suất có hold còn hạn + ngày thiếu giá; funnel có tỷ lệ hủy + payment attempt. **Chưa có bảng fact theo ngày** |
 | 26 | Truy vấn động whitelist + cache + chống stampede | 🟡 | **Export bất đồng bộ (`report_job`) ❌** |
 | 19–20 | Audit append-only (+ `attempt` REQUIRES_NEW), quản trị user/role/amenity | ✅ | Audit gọi tường minh, **không dùng AOP `@Audited`** |
-| 27–28 | Hội thoại, tin nhắn idempotent theo `clientMessageId`, cursor, unread, phản ánh/ticket, SUPPORT nhận khi quá hạn | ✅ 🟡 | Realtime SSE/WebSocket ❌ (client poll theo `afterSeq`); đính kèm ảnh ❌; `read_receipts` gộp vào participants |
+| 27–28 | Hội thoại (khách hoặc HOST của booking mở), tin nhắn idempotent theo `clientMessageId`, cursor, unread, phản ánh/ticket, SUPPORT nhận khi quá hạn | ✅ 🟡 | Realtime SSE/WebSocket ❌ (client poll theo `afterSeq`); đính kèm ảnh ❌; `read_receipts` gộp vào participants |
 | 30–31 | Cấu hình động; mẫu email có version bất biến, whitelist biến, escape HTML | ✅ 🟡 | "Gửi test" template ❌ |
 | 32–34 | Email giao dịch, nhắc check-in (DST-safe, EFFECTIVE_FOR_UNSENT), theo dõi/retry an toàn | ✅ | |
 

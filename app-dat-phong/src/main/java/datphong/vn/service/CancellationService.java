@@ -56,8 +56,10 @@ public class CancellationService {
     @Transactional(readOnly = true)
     public CancelPreview preview(AuthUser u, Long id) {
         Booking b = scoped(u, bookings.findById(id).orElseThrow(() -> BusinessException.notFound("Booking")));
-        BigDecimal captured = payments.capturedForBooking(id);
-        BigDecimal refunded = refundRepo.committedForPayment(latestSucceeded(id) == null ? -1L : latestSucceeded(id).getId());
+        // Cùng công thức với cancel(): dựa trên payment SUCCEEDED gần nhất của booking (khoản sẽ được hoàn khi hủy)
+        Payment paid = latestSucceeded(id);
+        BigDecimal captured = paid == null ? Money.zero() : paid.getAmount();
+        BigDecimal refunded = paid == null ? Money.zero() : refundRepo.committedForPayment(paid.getId());
         var res = CancellationCalculator.compute(clock.instant(), b.getFreeCancelDeadline(), b.getPenaltyPercent(), captured, refunded);
         return new CancelPreview(id, res.freeCancellation(), captured, res.fee(), res.refundable(), b.getFreeCancelDeadline(), b.getPenaltyPercent(), b.getStatus().name());
     }

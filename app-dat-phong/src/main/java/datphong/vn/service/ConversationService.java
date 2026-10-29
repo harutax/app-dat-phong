@@ -67,14 +67,19 @@ public class ConversationService {
     }
 
     // ------------------------------------------------------------------ mở hội thoại
-    public Map<String, Object> open(Long customerId, MessagingRequests.OpenConversation r) {
+    /**
+     * UC-27. CUSTOMER mở hội thoại INQUIRY (theo property PUBLISHED) hoặc BOOKING_SUPPORT (booking của chính mình).
+     * HOST có thể chủ động mở BOOKING_SUPPORT với khách của một booking thuộc cơ sở mình đang sở hữu.
+     * Cặp participant luôn suy ra từ DB (booking.customer, property.owner), không tin userId từ request.
+     */
+    public Map<String, Object> open(AuthUser u, MessagingRequests.OpenConversation r) {
         ConversationType type;
         try { type = ConversationType.valueOf(r.type()); } catch (Exception e) { throw BusinessException.validation("type phải là INQUIRY | BOOKING_SUPPORT"); }
-        rateLimit.check("conv:open:" + customerId, 10, Duration.ofHours(1));
+        rateLimit.check("conv:open:" + u.getId(), 10, Duration.ofHours(1));
         TransactionTemplate tx = new TransactionTemplate(txm);
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                return tx.execute(s -> openTx(customerId, type, r));
+                return tx.execute(s -> openTx(u, type, r));
             } catch (DataIntegrityViolationException e) {
                 // hai request khởi tạo song song: unique active key chặn bản thứ hai; lượt sau sẽ tìm thấy hội thoại đã tạo
                 if (attempt == 1) throw e;
@@ -83,24 +88,33 @@ public class ConversationService {
         throw new IllegalStateException();
     }
 
-    private Map<String, Object> openTx(Long customerId, ConversationType type, MessagingRequests.OpenConversation r) {
+    private Map<String, Object> openTx(AuthUser u, ConversationType type, MessagingRequests.OpenConversation r) {
         Property p;
         Long bookingId = r.bookingId();
+        Long customerId;
         if (bookingId != null) {
-            Booking b = bookings.findByIdAndCustomerId(bookingId, customerId).orElseThrow(() -> BusinessException.notFound("Booking"));
+            Booking b = bookings.findById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
             p = properties.findById(b.getPropertyId()).orElseThrow();
+            boolean isCustomer = b.getCustomerId().equals(u.getId());
+            boolean isOwner = p.getOwnerId().equals(u.getId()) && u.hasPermission("BOOKING_UPDATE");
+            if (!isCustomer && !isOwner) throw BusinessException.notFound("Booking");          // không có quan hệ hợp lệ
+            if (r.propertyId() != null && !p.getId().equals(r.propertyId())) throw BusinessException.validation("propertyId không khớp booking");
+            customerId = b.getCustomerId();
         } else {
             if (type == ConversationType.BOOKING_SUPPORT) throw BusinessException.validation("BOOKING_SUPPORT cần bookingId");
+            if (!u.hasPermission("BOOKING_CREATE")) throw BusinessException.forbidden("HOST chỉ mở hội thoại gắn với booking của cơ sở mình");
+            if (r.propertyId() == null) throw BusinessException.validation("Cần propertyId");
             p = properties.findById(r.propertyId()).filter(x -> x.getStatus() == PropertyStatus.PUBLISHED)
                     .orElseThrow(() -> BusinessException.notFound("Cơ sở"));
+            if (p.getOwnerId().equals(u.getId())) throw BusinessException.validation("Không thể mở hội thoại với chính cơ sở của mình");
+            customerId = u.getId();
         }
-        if (bookingId != null && !p.getId().equals(r.propertyId())) throw BusinessException.validation("propertyId không khớp booking");
-        User me = users.findById(customerId).orElseThrow();
+        User me = users.findById(u.getId()).orElseThrow();
         if (me.getStatus() != UserStatus.ACTIVE) throw BusinessException.forbidden("Tài khoản không được phép tạo hội thoại");
 
         Conversation c = conversations.findActive(customerId, p.getId(), type, bookingId).orElse(null);
         if (c == null) {
-            if (conversations.countOpenByCustomer(customerId) >= config.getInt("conversation.maxOpen")) {
+            if (customerId.equals(u.getId()) && conversations.countOpenByCustomer(customerId) >= config.getInt("conversation.maxOpen")) {
                 throw new BusinessException(ErrorCode.RATE_LIMITED, "Bạn đang có quá nhiều hội thoại mở");
             }
             c = new Conversation();
@@ -114,7 +128,7 @@ public class ConversationService {
             participants.save(new ConversationParticipant(c.getId(), p.getOwnerId(), "HOST"));
         }
         Conversation locked = conversations.lockById(c.getId()).orElseThrow();
-        Message m = appendMessage(locked, customerId, MessageType.NORMAL, r.firstMessage(), r.clientMessageId());
+        Message m = appendMessage(locked, u.getId(), MessageType.NORMAL, r.firstMessage(), r.clientMessageId());
         return Map.of("conversationId", locked.getId(), "type", locked.getType().name(), "status", locked.getStatus(),
                 "lastSeq", locked.getLastMessageSeq(), "firstMessageSeq", m.getSeq(), "bookingId", String.valueOf(bookingId));
     }

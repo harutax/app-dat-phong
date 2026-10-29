@@ -11,6 +11,7 @@ import datphong.vn.exception.entity.AuditLog;
 import datphong.vn.exception.BusinessException;
 import datphong.vn.repository.AmenityRepository;
 import datphong.vn.repository.AuditLogRepository;
+import datphong.vn.repository.RoleRepository;
 import datphong.vn.security.CurrentUser;
 import datphong.vn.service.*;
 import jakarta.validation.Valid;
@@ -36,11 +37,14 @@ public class AdminController {
     private final ConfigService config;
     private final AuditLogRepository auditRepo;
     private final AmenityRepository amenities;
+    private final RoleRepository roles;
+    private final SearchVersionService searchVersion;
     private final AuditService audit;
     private final EmailTemplateService templates;
     private final MailAdminService mailAdmin;
     private final ReconciliationService reconciliation;
     private final BookingQueryService bookingQueries;
+    private final datphong.vn.service.StayService stay;
 
     // ---- users / roles
     @GetMapping("/admin/users")
@@ -70,7 +74,26 @@ public class AdminController {
         return users.setRoles(CurrentUser.id(), id, r.roles(), r.reason());
     }
 
+    /** UC-20: danh sách role và permission hiện hành (chỉ đọc; cấp/thu quyền qua PUT /admin/users/{id}/roles). */
+    @GetMapping("/admin/roles")
+    @PreAuthorize("hasAuthority('ROLE_MANAGE')")
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> listRoles() {
+        return roles.findAll().stream().sorted(java.util.Comparator.comparing(r -> r.getCode())).map(r -> Map.<String, Object>of(
+                "code", r.getCode(),
+                "description", r.getDescription() == null ? "" : r.getDescription(),
+                "permissions", r.getPermissions().stream().map(p -> p.getCode()).sorted().toList())).toList();
+    }
+
     // ---- amenities
+    /** UC-20: danh mục tiện ích kể cả mục đã vô hiệu hóa (danh mục đang dùng không xóa cứng). */
+    @GetMapping("/admin/amenities")
+    @PreAuthorize("hasAuthority('AMENITY_MANAGE')")
+    public List<Map<String, Object>> listAmenities() {
+        return amenities.findAll().stream().sorted(java.util.Comparator.comparing(Amenity::getCode))
+                .map(a -> Map.<String, Object>of("code", a.getCode(), "name", a.getName(), "active", a.isActive())).toList();
+    }
+
     @PostMapping("/admin/amenities")
     @ResponseStatus(HttpStatus.CREATED)
     @PreAuthorize("hasAuthority('AMENITY_MANAGE')")
@@ -82,6 +105,7 @@ public class AdminController {
         a.setActive(r.active());                 // không xóa cứng: danh mục đang dùng chỉ bị vô hiệu hóa
         amenities.save(a);
         audit.record("AMENITY_UPSERT", "AMENITY", a.getCode(), null, null, null, null);
+        searchVersion.bump();                    // UC-20: làm mới cache danh mục/tìm kiếm đang dùng tiện ích này
         return Map.of("code", a.getCode(), "active", a.isActive());
     }
 
@@ -193,10 +217,40 @@ public class AdminController {
         return Map.of("status", "RECONCILED");
     }
 
+    /** UC-36: SUPPORT đối soát lại một payment chưa rõ trạng thái (hỏi bank theo idempotencyKey cũ). */
+    @PostMapping("/support/payments/{id}/reconcile")
+    @PreAuthorize("hasAuthority('SUPPORT_REFUND_RECONCILE')")
+    public Map<String, Object> reconcilePayment(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
+        return reconciliation.manualReconcilePayment(id, r.reason());
+    }
+
+    /** UC-36: tạo refund bù trừ cho ca đối soát (idempotent theo ca). */
+    @PostMapping("/support/reconciliation-cases/{id}/compensate")
+    @PreAuthorize("hasAuthority('SUPPORT_REFUND_RECONCILE')")
+    public CaseDto compensate(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
+        return reconciliation.compensate(id, CurrentUser.id(), r.reason());
+    }
+
+    /** UC-15 ngoại lệ: check-out booking chưa check-in, chỉ SUPPORT có quyền riêng + lý do + audit. */
+    @PostMapping("/support/bookings/{id}/force-checkout")
+    @PreAuthorize("hasAuthority('SUPPORT_STAY_EXCEPTION')")
+    public Map<String, String> forceCheckout(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
+        stay.supportForceCheckout(CurrentUser.id(), id, r.reason());
+        return Map.of("status", "COMPLETED");
+    }
+
     @GetMapping("/support/bookings/{id}")
     @PreAuthorize("hasAuthority('BOOKING_VIEW') and hasRole('SUPPORT')")
     public HostBookingDto supportBooking(@PathVariable Long id) {
         audit.record("SUPPORT_BOOKING_VIEW", "BOOKING", id, null, null, null, null);
         return bookingQueries.supportDetail(id);
+    }
+
+    /** UC-19: truy vết booking <-> payment <-> refund <-> ca đối soát <-> audit. Lượt truy cập dữ liệu nhạy cảm cũng được audit. */
+    @GetMapping("/support/bookings/{id}/trace")
+    @PreAuthorize("hasAuthority('AUDIT_READ') and hasAuthority('BOOKING_VIEW')")
+    public Map<String, Object> traceBooking(@PathVariable Long id) {
+        audit.record("SUPPORT_BOOKING_TRACE", "BOOKING", id, null, null, null, null);
+        return bookingQueries.trace(id);
     }
 }

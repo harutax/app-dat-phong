@@ -3,6 +3,7 @@ package datphong.vn.dto.response;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.List;
 
 public final class BookingResponses {
@@ -25,7 +26,7 @@ public final class BookingResponses {
 
     /** Góc nhìn của HOST: email che, số điện thoại chỉ hiện khi booking đang hiệu lực. */
     public record HostBookingDto(BookingDto booking, String customerName, String customerEmailMasked, String customerPhone,
-                                 List<StatusEntry> history) {}
+                                 LocalTime expectedArrivalTime, String hostNote, List<StatusEntry> history) {}
 
     public record CancelPreview(Long bookingId, boolean freeCancellation, BigDecimal capturedAmount, BigDecimal cancellationFee,
                                 BigDecimal refundableAmount, Instant freeCancelDeadline, int penaltyPercent, String status) {}

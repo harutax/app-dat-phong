@@ -1,8 +1,10 @@
 package datphong.vn.service;
 
 import datphong.vn.constant.BookingStatus;
+import datphong.vn.constant.PaymentStatus;
 import datphong.vn.exception.entity.Booking;
 import datphong.vn.repository.BookingRepository;
+import datphong.vn.repository.PaymentRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -28,6 +30,7 @@ public class BookingExpiryService {
     private static final int BATCH = 100;
 
     private final BookingRepository bookings;
+    private final PaymentRepository payments;
     private final BookingTransitions transitions;
     private final OutboxService outbox;
     private final BusinessEventService analytics;
@@ -37,10 +40,11 @@ public class BookingExpiryService {
     private final Clock clock;
     private final AtomicLong backlog = new AtomicLong();
 
-    public BookingExpiryService(BookingRepository bookings, BookingTransitions transitions, OutboxService outbox,
+    public BookingExpiryService(BookingRepository bookings, PaymentRepository payments, BookingTransitions transitions, OutboxService outbox,
                                 BusinessEventService analytics, ReminderService reminders, PlatformTransactionManager txm,
                                 MeterRegistry metrics, Clock clock) {
         this.bookings = bookings;
+        this.payments = payments;
         this.transitions = transitions;
         this.outbox = outbox;
         this.analytics = analytics;
@@ -76,6 +80,14 @@ public class BookingExpiryService {
         Booking b = bookings.claimExpired(id, now).orElse(null);   // đã bị worker khác khóa / đã đổi trạng thái -> bỏ qua
         if (b == null) return false;
         if (b.getStatus() != BookingStatus.PENDING_PAYMENT) return false;       // recheck trong transaction
+        // UC-11 bước 4-5: kiểm tra payment mới nhất (đã khóa booking trước -> cùng thứ tự khóa với PaymentCompletionService).
+        // Đã có payment SUCCEEDED mà booking vẫn chờ (vd. lệch số tiền đang chờ đối soát) -> không tự EXPIRED, để SUPPORT xử lý.
+        boolean captured = payments.findByBookingIdOrderByIdDesc(b.getId()).stream().anyMatch(p -> p.getStatus() == PaymentStatus.SUCCEEDED);
+        if (captured) {
+            metrics.counter("hold_expiry_skipped_total", "reason", "payment_succeeded").increment();
+            log.warn("booking {} quá hạn giữ chỗ nhưng đã có payment SUCCEEDED - bỏ qua, chờ đối soát", b.getId());
+            return false;
+        }
         transitions.to(b, BookingStatus.EXPIRED, "SCHEDULER", null, "Hết hạn giữ chỗ");
         transitions.release(b.getId());                                          // giải phóng đúng một lần
         reminders.cancelForBooking(b.getId());

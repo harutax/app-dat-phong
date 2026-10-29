@@ -25,8 +25,11 @@ public interface RefundRepository extends JpaRepository<Refund, Long> {
     @Query("select r from Refund r where r.id = :id")
     Optional<Refund> lockById(@Param("id") Long id);
 
-    /** Tổng hoàn đã thành công + đang xử lý/chờ (không tính FAILED đã bỏ) của một payment. */
-    @Query("select coalesce(sum(r.amount), 0) from Refund r where r.paymentId = :paymentId and r.status in (datphong.vn.constant.RefundStatus.REQUESTED, datphong.vn.constant.RefundStatus.PROCESSING, datphong.vn.constant.RefundStatus.SUCCEEDED)")
+    /**
+     * Tổng hoàn đã thành công + đang xử lý/chờ + FAILED (vẫn có thể được retry/đối soát với CÙNG refund_key) của một payment.
+     * Tính cả FAILED để một refund mới không bao giờ làm tổng hoàn vượt số tiền đã thu nếu refund cũ sau đó thành công.
+     */
+    @Query("select coalesce(sum(r.amount), 0) from Refund r where r.paymentId = :paymentId")
     BigDecimal committedForPayment(@Param("paymentId") Long paymentId);
 
     @Query("select coalesce(sum(r.amount), 0) from Refund r where r.bookingId = :bookingId and r.status = datphong.vn.constant.RefundStatus.SUCCEEDED")

@@ -3,6 +3,7 @@ package datphong.vn.config;
 import datphong.vn.security.JwtAuthenticationFilter;
 import datphong.vn.security.RestErrorHandlers;
 import lombok.RequiredArgsConstructor;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -33,6 +34,17 @@ public class SecurityConfig {
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder(11);
+    }
+
+    /**
+     * JwtAuthenticationFilter là @Component nên Spring Boot sẽ tự đăng ký thêm một lần ở mức servlet container.
+     * Tắt đăng ký đó: filter chỉ chạy BÊN TRONG security filter chain (đúng thứ tự, không xử lý JWT hai lần).
+     */
+    @Bean
+    public FilterRegistrationBean<JwtAuthenticationFilter> jwtFilterRegistration(JwtAuthenticationFilter f) {
+        FilterRegistrationBean<JwtAuthenticationFilter> reg = new FilterRegistrationBean<>(f);
+        reg.setEnabled(false);
+        return reg;
     }
 
     @Bean

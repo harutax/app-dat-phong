@@ -112,6 +112,18 @@ public class EmailTemplateService {
         for (String req : def.vars()) if (req.equals("verificationLink") || req.equals("bookingCode") || req.equals("verificationCode")) {
             if (def.vars().contains(req) && !used.contains(req)) problems.add("thiếu biến bắt buộc: " + req);
         }
+        // Render thử với dữ liệu mẫu (UC-31 bước 3): phát hiện biến thiếu/lỗi cú pháp trước khi thay bản đang hoạt động
+        if (problems.isEmpty()) {
+            Map<String, Object> sample = new HashMap<>();
+            for (String name : allowed) sample.put(name, "<" + name + ">");
+            try {
+                renderer.render(v.getSubjectTemplate(), v.getHtmlBody(), v.getTextBody(), allowed, sample);
+            } catch (TemplateRenderer.MissingVariableException | IllegalArgumentException e) {
+                problems.add("render thử thất bại: " + e.getMessage());
+            }
+            String unclosed = (v.getSubjectTemplate() + v.getHtmlBody() + v.getTextBody()).replaceAll("\\{\\{\\s*[A-Za-z][A-Za-z0-9_]*\\s*}}", "");
+            if (unclosed.contains("{{") || unclosed.contains("}}")) problems.add("cú pháp biến không hợp lệ (thiếu {{ hoặc }})");
+        }
         if (!problems.isEmpty()) throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Template chưa đủ điều kiện publish", problems);
 
         versions.findByTemplateIdOrderByVersionDesc(templateId).stream().filter(x -> x.getStatus().equals("ACTIVE")).forEach(x -> x.setStatus("ARCHIVED"));

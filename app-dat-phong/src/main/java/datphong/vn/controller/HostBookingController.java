@@ -47,14 +47,14 @@ public class HostBookingController {
         return Map.of("status", "OK");
     }
 
-    @PostMapping("/{id}/checkin")
+    @PostMapping({"/{id}/checkin", "/{id}/check-in"})
     @PreAuthorize("hasAuthority('STAY_MANAGE')")
     public Map<String, String> checkIn(@PathVariable Long id) {
         stay.checkIn(CurrentUser.id(), id);
         return Map.of("status", "CHECKED_IN");
     }
 
-    @PostMapping("/{id}/check-out")
+    @PostMapping({"/{id}/checkout", "/{id}/check-out"})
     @PreAuthorize("hasAuthority('STAY_MANAGE')")
     public Map<String, String> checkOut(@PathVariable Long id) {
         stay.checkOut(CurrentUser.id(), id);

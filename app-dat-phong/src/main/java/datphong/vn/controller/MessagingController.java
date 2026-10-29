@@ -23,11 +23,12 @@ public class MessagingController {
     private final ConversationService chat;
     private final CheckinRequestService checkin;
 
+    /** UC-27: khách mở hội thoại với cơ sở; HOST mở hội thoại với khách của một booking thuộc cơ sở mình (bắt buộc bookingId). */
     @PostMapping("/conversations")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAuthority('BOOKING_CREATE')")
+    @PreAuthorize("hasAnyAuthority('BOOKING_CREATE', 'BOOKING_UPDATE')")
     public Map<String, Object> open(@Valid @RequestBody MessagingRequests.OpenConversation r) {
-        return chat.open(CurrentUser.id(), r);
+        return chat.open(CurrentUser.require(), r);
     }
 
     @GetMapping("/conversations")
@@ -92,6 +93,12 @@ public class MessagingController {
     @PreAuthorize("hasAuthority('BOOKING_CREATE')")
     public Map<String, Object> create(@PathVariable Long id, @Valid @RequestBody MessagingRequests.CheckinCreate r) {
         return view(checkin.create(CurrentUser.id(), id, r));
+    }
+
+    /** UC-29: tra cứu lịch đến/lịch sử đề nghị check-in của booking (khách của booking hoặc HOST sở hữu cơ sở). */
+    @GetMapping("/bookings/{id}/checkin-requests")
+    public List<Map<String, Object>> listCheckinRequests(@PathVariable Long id) {
+        return checkin.forBooking(CurrentUser.require(), id).stream().map(MessagingController::view).toList();
     }
 
     @PatchMapping("/checkin-requests/{id}/respond")

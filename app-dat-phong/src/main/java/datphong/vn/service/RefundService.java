@@ -79,7 +79,7 @@ public class RefundService {
     /** @return true nếu đã gọi bank. */
     public boolean process(Long refundId) {
         TransactionTemplate tx = new TransactionTemplate(txManager);
-        record Ctx(String key, String providerTxnId, BigDecimal amount, String currency, String reason) {}
+        record Ctx(String key, String providerTxnId, BigDecimal amount, String currency, String reason, int attempt) {}
 
         // Bước 1 (commit trước khi gọi bank): REQUESTED/FAILED -> PROCESSING
         Ctx ctx = tx.execute(s -> {
@@ -91,7 +91,7 @@ public class RefundService {
             if (p.getProviderTxnId() == null) return null; // chưa có giao dịch bank để hoàn
             r.setStatus(RefundStatus.PROCESSING);
             r.setAttempts(r.getAttempts() + 1);
-            return new Ctx(r.getRefundKey(), p.getProviderTxnId(), r.getAmount(), p.getCurrency(), r.getReason());
+            return new Ctx(r.getRefundKey(), p.getProviderTxnId(), r.getAmount(), p.getCurrency(), r.getReason(), r.getAttempts());
         });
         if (ctx == null) return false;
 
@@ -99,7 +99,8 @@ public class RefundService {
         try {
             FakeBankClient.BankRefund res = bank.refund(ctx.key(), ctx.providerTxnId(), ctx.amount(), ctx.currency(), ctx.reason());
             if ("SUCCEEDED".equals(res.status()) || "FAILED".equals(res.status())) {
-                applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(), "sync-refund:" + ctx.key() + ":" + res.status());
+                // eventId gắn số lần thử: kết quả FAILED của lần retry sau KHÔNG bị coi là bản lặp của lần trước (nếu không refund kẹt PROCESSING mãi)
+                applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(), "sync-refund:" + ctx.key() + ":" + ctx.attempt() + ":" + res.status());
             }
             // PROCESSING/ACCEPTED: chờ webhook hoặc đối soát
         } catch (FakeBankClient.BankUnknownException e) {
@@ -130,7 +131,9 @@ public class RefundService {
         if (r.getStatus() == RefundStatus.SUCCEEDED) return; // idempotent
 
         if ("SUCCEEDED".equals(status)) {
-            if (r.getStatus() == RefundStatus.REQUESTED) r.setStatus(RefundStatus.PROCESSING); // webhook đến trước bước PROCESSING
+            // webhook đến trước bước PROCESSING, hoặc bank xác nhận thành công cho một lần thử đã bị coi là FAILED (timeout/đối soát sớm):
+            // tiền đã hoàn thật ở bank là nguồn sự thật -> đi qua PROCESSING rồi SUCCEEDED (không hoàn thêm lần nào nữa).
+            if (r.getStatus() == RefundStatus.REQUESTED || r.getStatus() == RefundStatus.FAILED) r.setStatus(RefundStatus.PROCESSING);
             if (!Transitions.canTransition(r.getStatus(), RefundStatus.SUCCEEDED)) return;
             r.setStatus(RefundStatus.SUCCEEDED);
             r.setProviderRef(providerRef);

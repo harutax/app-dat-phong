@@ -52,14 +52,16 @@ public class BookingCreator {
     public Result create(Long customerId, BookingRequests.Create req, String requestHash) {
         String scope = "booking:create:" + customerId;
 
+        // Idempotency kiểm tra TRƯỚC mọi validate: cùng key + cùng payload luôn trả lại kết quả cũ,
+        // kể cả khi sau đó phòng/cơ sở đã đổi trạng thái hoặc ngày nhận phòng đã qua.
+        var replay = idempotency.lookup(scope, req.idempotencyKey(), requestHash);
+        if (replay.isPresent()) return new Result(bookings.findById(Long.valueOf(replay.get())).orElseThrow(), true);
+
         Room room = rooms.findById(req.roomId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
         Property property = properties.findById(room.getPropertyId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
         RoomType type = roomTypes.findById(room.getRoomTypeId()).orElseThrow();
         if (property.getStatus() != PropertyStatus.PUBLISHED) throw new BusinessException(ErrorCode.ROOM_UNAVAILABLE, "Cơ sở không mở bán");
         StayPeriod period = pricing.validateStay(property, type, req.checkIn(), req.checkOut(), req.guestCount());
-
-        var replay = idempotency.lookup(scope, req.idempotencyKey(), requestHash);
-        if (replay.isPresent()) return new Result(bookings.findById(Long.valueOf(replay.get())).orElseThrow(), true);
 
         // (1) khóa phòng - các request cạnh tranh cùng phòng được tuần tự hóa tại đây
         Room locked = rooms.lockById(req.roomId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
@@ -78,9 +80,12 @@ public class BookingCreator {
 
         // Giá/chính sách hiện hành đọc TRONG transaction, server tự tính tiền
         PricingCalculator.Quote q = pricing.price(type, period);
-        if (req.expectedTotal() != null && req.expectedTotal().compareTo(q.total()) != 0) {
+        String currentPriceVersion = pricing.priceVersion(q);
+        boolean totalChanged = req.expectedTotal() != null && req.expectedTotal().compareTo(q.total()) != 0;
+        boolean versionChanged = req.priceVersion() != null && !req.priceVersion().isBlank() && !req.priceVersion().equals(currentPriceVersion);
+        if (totalChanged || versionChanged) {
             throw new BusinessException(ErrorCode.PRICE_CHANGED, "Giá đã thay đổi so với báo giá",
-                    Map.of("newTotal", q.total(), "priceVersion", pricing.priceVersion(q)));
+                    Map.of("newTotal", q.total(), "priceVersion", currentPriceVersion));
         }
 
         Booking b = new Booking();

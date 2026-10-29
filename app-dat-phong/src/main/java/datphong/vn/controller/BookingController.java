@@ -44,12 +44,15 @@ public class BookingController {
         return queries.customerView(CurrentUser.id(), id);
     }
 
+    /** UC-12: CUSTOMER hủy booking của mình; SUPPORT hủy hộ khi có quyền SUPPORT_BOOKING_CANCEL (scope kiểm tra trong service). */
     @GetMapping("/{id}/cancel-preview")
+    @PreAuthorize("hasAnyAuthority('BOOKING_CREATE', 'SUPPORT_BOOKING_CANCEL')")
     public CancelPreview preview(@PathVariable Long id) {
         return cancellation.preview(CurrentUser.require(), id);
     }
 
     @PostMapping("/{id}/cancel")
+    @PreAuthorize("hasAnyAuthority('BOOKING_CREATE', 'SUPPORT_BOOKING_CANCEL')")
     public CancelResult cancel(@PathVariable Long id, @Valid @RequestBody BookingRequests.Cancel req) {
         AuthUser u = CurrentUser.require();
         return cancellation.cancel(u, id, req);

@@ -58,6 +58,9 @@ public class BookingQueryService {
     /** HOST: owner scope được ÉP trong SQL (JOIN properties ... owner_id), không lọc sau ở tầng Java. */
     @Transactional(readOnly = true)
     public Page<BookingDto> hostList(Long ownerId, Long propertyId, BookingStatus status, LocalDate from, LocalDate to, int page, int size) {
+        if (propertyId != null && properties.findByIdAndOwnerId(propertyId, ownerId).isEmpty()) {
+            throw BusinessException.forbidden("Cơ sở không thuộc phạm vi quản lý của bạn");   // UC-14: lọc property ngoài scope
+        }
         StringBuilder where = new StringBuilder(" WHERE p.owner_id = :owner");
         MapSqlParameterSource ps = new MapSqlParameterSource("owner", ownerId);
         if (propertyId != null) { where.append(" AND b.property_id = :pid"); ps.addValue("pid", propertyId); }
@@ -90,7 +93,8 @@ public class BookingQueryService {
         boolean active = b.getStatus() == BookingStatus.CONFIRMED || b.getStatus() == BookingStatus.CHECKED_IN;
         List<StatusEntry> hist = history.findByBookingIdOrderByAtAscIdAsc(bookingId).stream()
                 .map(h -> new StatusEntry(h.getFromStatus() == null ? null : h.getFromStatus().name(), h.getToStatus().name(), h.getActorType(), h.getReason(), h.getAt())).toList();
-        return new HostBookingDto(toDto(b, false), c.getFullName(), Texts.maskEmail(c.getEmail()), active ? c.getPhone() : Texts.maskPhone(c.getPhone()), hist);
+        return new HostBookingDto(toDto(b, false), c.getFullName(), Texts.maskEmail(c.getEmail()), active ? c.getPhone() : Texts.maskPhone(c.getPhone()),
+                b.getExpectedArrivalTime(), b.getHostNote(), hist);
     }
 
     /** SUPPORT/ADMIN (có BOOKING_VIEW): xem theo quyền được cấp, dữ liệu liên hệ che. */
@@ -100,7 +104,63 @@ public class BookingQueryService {
         User c = users.findById(b.getCustomerId()).orElseThrow();
         List<StatusEntry> hist = history.findByBookingIdOrderByAtAscIdAsc(bookingId).stream()
                 .map(h -> new StatusEntry(h.getFromStatus() == null ? null : h.getFromStatus().name(), h.getToStatus().name(), h.getActorType(), h.getReason(), h.getAt())).toList();
-        return new HostBookingDto(toDto(b, false), c.getFullName(), Texts.maskEmail(c.getEmail()), Texts.maskPhone(c.getPhone()), hist);
+        return new HostBookingDto(toDto(b, false), c.getFullName(), Texts.maskEmail(c.getEmail()), Texts.maskPhone(c.getPhone()),
+                b.getExpectedArrivalTime(), b.getHostNote(), hist);
+    }
+
+    /**
+     * UC-19: chuỗi truy vết booking -> payment -> callback/webhook -> refund -> ca đối soát -> audit để SUPPORT điều tra sự cố.
+     * Chỉ trả trường cần thiết: không có payerAccount, idempotencyKey hay payload webhook.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> trace(Long bookingId) {
+        Booking b = bookings.findById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
+        List<Payment> pays = payments.findByBookingIdOrderByIdDesc(bookingId);
+        List<Refund> refs = refunds.findByBookingIdOrderByIdDesc(bookingId);
+        List<String> payIds = pays.isEmpty() ? List.of("-") : pays.stream().map(p -> String.valueOf(p.getId())).toList();
+        List<String> refIds = refs.isEmpty() ? List.of("-") : refs.stream().map(r -> String.valueOf(r.getId())).toList();
+        List<Long> payIdNums = pays.isEmpty() ? List.of(-1L) : pays.stream().map(Payment::getId).toList();
+        MapSqlParameterSource ps = new MapSqlParameterSource("bid", bookingId).addValue("bidStr", String.valueOf(bookingId))
+                .addValue("pids", payIds).addValue("rids", refIds).addValue("pidNums", payIdNums);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("booking", Map.of("id", b.getId(), "bookingCode", b.getBookingCode(), "status", b.getStatus().name(),
+                "totalAmount", b.getTotalAmount(), "currency", b.getCurrency()));
+        out.put("statusHistory", history.findByBookingIdOrderByAtAscIdAsc(bookingId).stream()
+                .map(h -> new StatusEntry(h.getFromStatus() == null ? null : h.getFromStatus().name(), h.getToStatus().name(), h.getActorType(), h.getReason(), h.getAt())).toList());
+        out.put("payments", pays.stream().map(p -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", p.getId());
+            m.put("intentCode", p.getIntentCode());
+            m.put("status", p.getStatus().name());
+            m.put("amount", p.getAmount());
+            m.put("providerTxnId", p.getProviderTxnId());
+            m.put("failureCode", p.getFailureCode());
+            m.put("attempts", p.getAttempts());
+            m.put("capturedAt", p.getCapturedAt());
+            return m;
+        }).toList());
+        out.put("providerEvents", jdbc.queryForList("SELECT provider_event_id, payment_id, event_type, received_at FROM payment_events "
+                + "WHERE payment_id IN (:pidNums) ORDER BY received_at, id", ps));
+        out.put("refunds", refs.stream().map(r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", r.getId());
+            m.put("paymentId", r.getPaymentId());
+            m.put("status", r.getStatus().name());
+            m.put("amount", r.getAmount());
+            m.put("reason", r.getReason());
+            m.put("attempts", r.getAttempts());
+            m.put("failureCode", r.getFailureCode());
+            m.put("providerRef", r.getProviderRef());
+            m.put("succeededAt", r.getSucceededAt());
+            return m;
+        }).toList());
+        out.put("reconciliationCases", jdbc.queryForList("SELECT id, type, status, payment_id, refund_id, details, resolution_note, created_at, resolved_at "
+                + "FROM reconciliation_cases WHERE booking_id = :bid OR payment_id IN (:pidNums) ORDER BY created_at, id", ps));
+        out.put("audit", jdbc.queryForList("SELECT action, entity_type, entity_id, actor_id, request_id, from_state, to_state, reason, outcome, at "
+                + "FROM audit_logs WHERE (entity_type = 'BOOKING' AND entity_id = :bidStr) OR (entity_type = 'PAYMENT' AND entity_id IN (:pids)) "
+                + "OR (entity_type = 'REFUND' AND entity_id IN (:rids)) ORDER BY at, id LIMIT 500", ps));
+        return out;
     }
 
     private BookingDto toDto(Booking b, boolean customerView) {

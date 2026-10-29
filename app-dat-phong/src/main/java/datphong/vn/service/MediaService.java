@@ -11,7 +11,7 @@ import datphong.vn.exception.ErrorCode;
 import datphong.vn.repository.MediaAssetRepository;
 import datphong.vn.repository.RoomTypeRepository;
 import io.minio.*;
-import io.minio.http.Method;
+import io.minio.Http.Method;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;

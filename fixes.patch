@@ -1,0 +1,1642 @@
+diff --git a/BAO_CAO_SUA_LOI.md b/BAO_CAO_SUA_LOI.md
+new file mode 100644
+index 0000000..f83072f
+--- /dev/null
++++ b/BAO_CAO_SUA_LOI.md
+@@ -0,0 +1,82 @@
++# Báo cáo rà soát & sửa lỗi theo "Đặc tả luồng use case chuyên sâu"
++
++Phạm vi: đối chiếu mã nguồn `app-dat-phong` + `fake-bank` với UC-01 → UC-36 và checklist nghiệm thu (mục 6, 8, 9 của tài liệu).
++Toàn bộ thay đổi chưa commit — xem chi tiết bằng `git diff` (hoặc file `fixes.patch` đi kèm).
++
++## Cách kiểm chứng đã làm
++
++| Hạng mục | Kết quả |
++|---|---|
++| 22 unit test domain (StayPeriod, PricingCalculator, CancellationCalculator, Transitions, HmacSigner) | **Pass** (chạy lại sau khi sửa) |
++| Parse toàn bộ mã nguồn bằng `javac` (app + fake-bank) | Không có lỗi cú pháp |
++| Đối chiếu entity JPA ↔ `V1__init_schema.sql` (tên cột/kiểu) bằng script | Khớp, không cột thiếu |
++| Symbol do mã mới gọi tới (repository/entity/service trong dự án) | Đều tồn tại |
++| `mvn verify`, Flyway trên PostgreSQL, `BookingConcurrencyIT`, `docker compose up` | **Chưa chạy được**: môi trường rà soát bị chặn Maven Central/Docker. Cần chạy lại trên máy có mạng |
++
++## Lỗi chặn build / chạy
++
++| # | Vị trí | Lỗi | Sửa |
++|---|---|---|---|
++| 1 | `config/DemoDataSeeder.java` | File có BOM UTF-8 ở đầu → `javac` báo `illegal character '﻿'`, **cả project không biên dịch được** | Bỏ BOM |
++| 2 | `ops/prometheus.yml` | Header `X-Metrics-Token: ["${METRICS_TOKEN}"]` — Prometheus không thay biến môi trường → scrape luôn 403 | Đọc token từ file `/tmp/metrics_token` (đúng như entrypoint trong compose đã ghi) |
++| 3 | `Dockerfile` (app, fake-bank) | Healthcheck dùng `curl` nhưng image JRE không bảo đảm có `curl` → container có thể mãi `unhealthy`, `app` không khởi động | Cài `curl` tường minh |
++
++## Lỗi nghiệp vụ theo use case
++
++| UC | Vị trí | Lỗi | Sửa |
++|---|---|---|---|
++| UC-09 | `BookingCreator` | Idempotency được kiểm tra **sau** khi validate ngày/phòng → gửi lại cùng key + cùng payload sau khi phòng đổi trạng thái/qua ngày nhận phòng thì bị lỗi thay vì trả kết quả cũ | Tra idempotency trước mọi validate |
++| UC-08/09 | `BookingCreator` | `priceVersion` của báo giá được nhận nhưng **không bao giờ so sánh** → không phát hiện `PRICE_CHANGED` khi chỉ gửi priceVersion | So `priceVersion` và `expectedTotal`, trả `PRICE_CHANGED` kèm giá mới |
++| UC-10 | `PaymentService` | Gọi Fake Bank khi payment còn `INITIATED` (đặc tả: commit `PROCESSING` trước khi gọi bank); booking tổng 0đ làm vi phạm `CHECK amount > 0` → 500 | Commit `PROCESSING` (+attempts) trước khi gọi bank; chặn booking 0đ bằng lỗi nghiệp vụ |
++| UC-10/25 | `BusinessEventService` | `REQUIRES_NEW` + JPA save: trùng `event_id` khi 2 luồng ghi đồng thời nổ lúc **commit** (ngoài try/catch) → làm hỏng luôn giao dịch thanh toán/booking đang gọi | Ghi best-effort bằng `INSERT … ON CONFLICT DO NOTHING`, `NOT_SUPPORTED` (autocommit), không bao giờ ném lỗi ngược |
++| UC-12 | `CancellationService.preview` | Preview tính tiền đã thu = tổng mọi payment, còn khi hủy thật lại dùng payment gần nhất → số "dự kiến hoàn" lệch với số hoàn thật | Dùng cùng công thức với `cancel()` |
++| UC-13/36 | `RefundRepository.committedForPayment` | Không tính refund `FAILED` đang chờ retry → có thể tạo refund mới, rồi refund cũ retry thành công ⇒ **tổng hoàn vượt số đã thu** | Tính mọi refund của payment (FAILED vẫn có thể được retry/đối soát cùng key) |
++| UC-13/34 | `RefundService`, `ReconciliationService` | eventId kết quả đồng bộ/đối soát là `sync-refund:{key}:{status}` — lần retry thứ 2 trả `FAILED` bị coi là **bản lặp** → refund kẹt `PROCESSING` mãi, không bao giờ tới `REFUND_STUCK` | Gắn số lần thử vào eventId |
++| UC-13 | `RefundService.applyResult` | Bank xác nhận hoàn thành công cho lần thử đã bị đánh `FAILED` (timeout/đối soát sớm) → bị bỏ qua, nội bộ lệch với bank | Cho `FAILED → PROCESSING → SUCCEEDED` khi bank xác nhận |
++| UC-14 | `BookingQueryService.hostList` | Lọc theo property không thuộc mình trả danh sách rỗng (đặc tả: `FORBIDDEN_SCOPE`) | Trả `FORBIDDEN_SCOPE` |
++| UC-15 | `StayService`, `AdminController`, V3 | Check-out ngoại lệ (chưa check-in) bởi SUPPORT chưa có | `POST /support/bookings/{id}/force-checkout`, quyền mới `SUPPORT_STAY_EXCEPTION`, bắt buộc lý do, đi qua state machine, audit |
++| UC-15 | `HostBookingController` | Đường dẫn không nhất quán `/checkin` vs `/check-out` | Nhận cả `/check-in`, `/checkin`, `/check-out`, `/checkout` |
++| UC-17 | `OutboxProcessor.markFailure` | Sau lỗi, "claim lại event đầu hàng đợi" để tăng retry → có thể phạt nhầm event khác (instance khác đã lấy event lỗi) | Đánh dấu lỗi theo đúng id event |
++| UC-18/21–25 | `AnalyticsService` | (a) HOST truyền `propertyId` của người khác nhận số 0 thay vì `FORBIDDEN_SCOPE`; (b) kỳ báo cáo cắt theo ngày **UTC** thay vì múi giờ cơ sở | (a) kiểm tra owner → `FORBIDDEN_SCOPE`; (b) chuẩn hóa ranh giới ngày theo timezone property (hoặc mặc định Asia/Ho_Chi_Minh), trả `timezone` trong kết quả |
++| UC-22 | `AnalyticsService.query` | `limit` âm làm SQL lỗi; `statuses` không validate | Validate `limit` 1..1000 và status |
++| UC-23 | `AnalyticsController` | Thiếu báo cáo dòng tiền: giao dịch đang xử lý/thất bại, refund pending/failed, trạng thái đối soát | `GET /analytics/cashflow` |
++| UC-24 | `AnalyticsService.occupancy` | Không có hold còn hạn và ngày thiếu giá (đặc tả yêu cầu) | Thêm `heldRoomNights`, `roomTypesMissingRate`, `daysMissingRate` |
++| UC-25 | `AnalyticsService.funnel` | Thiếu tỷ lệ hủy và số payment attempt tách riêng khỏi số booking | Thêm `cancellation` và `paymentAttemptsByStatus` |
++| UC-05 | `CatalogService` | Tạo phòng/đặt giá cho cơ sở `ARCHIVED`; kiểm tra giảm sức chứa dùng ngày UTC và chặn mọi booking tương lai (kể cả đủ sức chứa); kiểm tra version trước ownership (lộ tồn tại) | Chặn ARCHIVED; chỉ chặn khi có booking/hold tương lai vượt sức chứa mới, theo timezone cơ sở; kiểm tra quyền trước |
++| UC-02 | `AuthService.login` | Hash giả để "làm đều thời gian" dài 59 ký tự (không hợp lệ BCrypt) → so khớp trả về ngay ⇒ lộ email tồn tại qua thời gian phản hồi; không ghi nhận kết quả đăng nhập/đăng xuất | Dùng hash BCrypt hợp lệ cùng cost; audit `LOGIN_SUCCESS/LOGIN_FAILURE/LOGOUT` |
++| UC-27 | `ConversationService`, `MessagingController` | HOST không mở được hội thoại (đặc tả: khách **hoặc HOST**) | HOST mở `BOOKING_SUPPORT` cho booking thuộc cơ sở mình; participant suy ra từ DB |
++| UC-29 | `CheckinRequestService` | (a) `respond` đóng yêu cầu (`CLOSED`) rồi ném lỗi → bị rollback, yêu cầu vẫn treo `PENDING`; (b) khách `accept` không thông báo HOST; (c) không có API tra cứu lịch đến | (a) `noRollbackFor`; (b) tin nhắn + outbox `CHECKIN_REQUEST_ACCEPTED` + audit; (c) `GET /bookings/{id}/checkin-requests` (khách/HOST sở hữu) |
++| UC-29 | `StayService.noShow` | Không thông báo khách khi bị ghi nhận vắng mặt | Outbox `BOOKING_NO_SHOW` → notification |
++| UC-30 | `ConfigService`, V3 | Lên lịch giá trị cấu hình ở tương lai làm hệ thống **rơi về default** cho tới thời điểm hiệu lực (ghi đè bản ghi duy nhất); giá trị `null` gây 500 | Cột `previous_value`: dùng giá trị đang hiệu lực tới `effective_at`; validate null |
++| UC-31 | `EmailTemplateService.publish` | Không render thử trước publish (đặc tả bước 3), cú pháp `{{` hở không bị phát hiện | Render thử với dữ liệu mẫu + kiểm tra cú pháp biến |
++| UC-32 | `MailService` | Dedupe key gồm cả template version → publish mẫu mới làm cùng sự kiện tạo email thứ hai | Dedupe theo loại sự kiện + khóa nghiệp vụ + người nhận |
++| UC-34 | `MailWorker` | `templateVersionId` null → `findById(null)` ném lỗi, mail kẹt `SENDING` | Kiểm tra null → `FAILED_VALIDATION` |
++| UC-36 | `ReconciliationService`, `AdminController` | SUPPORT không có thao tác "retry/đối soát payment" và "tạo refund bù trừ" cho ca `NEEDS_ATTENTION` | `POST /support/payments/{id}/reconcile` (hỏi bank bằng idempotencyKey cũ), `POST /support/reconciliation-cases/{id}/compensate` (refund key ổn định `comp-case-{id}`, không vượt captured) — có lý do + audit |
++| — | `SecurityConfig` | `JwtAuthenticationFilter` là `@Component` nên bị Spring Boot đăng ký thêm ở mức servlet | Tắt đăng ký servlet, chỉ chạy trong security chain |
++
++## Fake Bank (UC-35)
++
++| Lỗi | Sửa |
++|---|---|
++| `TEST-LOST`, `TEST-DELAY`, `TEST-DUP` trả `SUCCEEDED` đồng bộ → booking xác nhận ngay, **không bao giờ** đi qua nhánh mất/chậm/lặp callback như ma trận kịch bản | Trả `ACCEPTED` (kết quả cuối qua webhook/đối soát); tra cứu vẫn trả trạng thái thật |
++| `TEST-DBFAIL` ném lỗi trước khi ghi gì → không thực sự kiểm chứng rollback | Ghi số dư/sổ cái/outbox rồi mới lỗi → rollback toàn bộ, trả 503 |
++| Refund `FAILED` không thể thử lại cùng `refundKey` (trả mãi kết quả cũ) dù kịch bản đã đổi | Cho retry cùng key, eventId mới mỗi lần |
++| Nhận mọi chuỗi `payerAccount` (đặc tả: tuyệt đối không dùng tài khoản/thẻ thật) | Chỉ nhận `TEST-*`/`MERCHANT-*`, chặn chuỗi giống số thẻ |
++| Thiếu API tạo tài khoản giả lập; `ledger-check` chỉ so tổng | `POST /fakebank/api/v1/admin/accounts`; ledger-check kiểm tra từng giao dịch, số dư âm, giao dịch thiếu bút toán, hoàn vượt |
++| Số tiền gửi dạng số thực JSON | Gửi chuỗi thập phân (không mất chính xác) |
++
++## Migration mới
++
++`V3__usecase_fixes.sql`: cột `config_values.previous_value`, quyền `SUPPORT_STAY_EXCEPTION` cho SUPPORT, index ca đối soát.
++
++## Còn lại (backlog đúng như đặc tả ghi nhận, chưa làm)
++
++Export analytics bất đồng bộ (`report_job`), realtime SSE/WebSocket, đính kèm ảnh trong chat, gửi thử email template, lịch đóng bán theo ngày, bảng `daily_*_fact`, frontend.
++
++## Việc cần làm trên máy có mạng
++
++```bash
++cd app-dat-phong && mvn -q verify            # build + unit test
++mvn -Dtest=BookingConcurrencyIT test         # cần Docker
++docker compose up --build                    # thử các tài khoản TEST-* của Fake Bank
++```
+diff --git a/README.md b/README.md
+index 34c0c42..e2ec88e 100644
+--- a/README.md
++++ b/README.md
+@@ -20,7 +20,9 @@ hotel/
+ | Flyway SQL (schema, exclusion constraint) | **Chưa chạy trên PostgreSQL** |
+ | `BookingConcurrencyIT` (50 request đồng thời, idempotency, callback muộn…) | Đã viết, **chưa chạy** (cần Docker) |
+ 
+-Lần đầu: `cd app-dat-phong && mvn -q verify`. `spring.jpa.hibernate.ddl-auto=validate` sẽ chỉ ra ngay cột/kiểu nào lệch giữa entity và `V1__init_schema.sql`.
++Lần đầu: `cd app-dat-phong && mvn -q verify`.
++
++> **Lần rà soát theo tài liệu đặc tả use case (UC-01..UC-36):** đã sửa các lỗi liệt kê trong `BAO_CAO_SUA_LOI.md` (kèm migration `V3__usecase_fixes.sql`). Môi trường rà soát không truy cập được Maven Central nên vẫn **chưa build Maven**; 22 unit test domain chạy lại vẫn pass, toàn bộ mã nguồn đã qua bước parse của `javac` và đối chiếu ánh xạ entity ↔ `V1__init_schema.sql`. `spring.jpa.hibernate.ddl-auto=validate` sẽ chỉ ra ngay cột/kiểu nào lệch giữa entity và `V1__init_schema.sql`.
+ 
+ ## Chạy
+ 
+@@ -74,16 +76,16 @@ docker compose up --build
+ | 06 | Ảnh MinIO: presigned PUT, finalize (HEAD + magic bytes), dọn mồ côi | ✅ | Endpoint nằm dưới `/host/media/*` (đặc tả: `/media/*`) |
+ | 07–08 | Tìm kiếm (SQL động, bind param, sort whitelist, cache), chi tiết, báo giá | ✅ | |
+ | 09 | Booking + hold: lock + exclusion + idempotency + retry lock, snapshot giá/chính sách | ✅ | |
+-| 10, 35, 36 | Thanh toán Fake Bank, webhook HMAC, UNKNOWN, đối soát, bù trừ | ✅ | `payment_intents` gộp vào `payments` (`intent_code`) |
++| 10, 35, 36 | Thanh toán Fake Bank, webhook HMAC, UNKNOWN, đối soát, bù trừ | ✅ | `payment_intents` gộp vào `payments` (`intent_code`); SUPPORT: `POST /support/payments/{id}/reconcile`, `POST /support/reconciliation-cases/{id}/compensate` |
+ | 11 | Hết hạn giữ chỗ (SKIP LOCKED, recheck, giải phóng một lần) | ✅ | |
+ | 12–13 | Hủy + phí, refund saga, đối soát, ca `NEEDS_ATTENTION` | ✅ | Hủy khi `CHECKED_IN` chỉ SUPPORT |
+-| 14–15, 29 | Host xử lý booking, check-in/out, no-show, đề nghị giờ check-in | ✅ | Check-out ngoại lệ (chưa check-in) bởi SUPPORT: ❌ |
++| 14–15, 29 | Host xử lý booking, check-in/out, no-show, đề nghị giờ check-in | ✅ | Check-out ngoại lệ (chưa check-in) bởi SUPPORT: `POST /support/bookings/{id}/force-checkout` (quyền `SUPPORT_STAY_EXCEPTION`, lý do + audit); tra cứu lịch hẹn `GET /bookings/{id}/checkin-requests` |
+ | 16 | Review, phản hồi host, kiểm duyệt có audit | ✅ | |
+ | 17 | Outbox + notification | ✅ | |
+-| 18, 21–25 | Dashboard, đa chiều, doanh thu/dòng tiền (aggregate **riêng** từng grain), công suất (date spine), funnel | ✅ 🟡 | Tính trực tiếp SQL + cache Redis; **chưa có bảng fact theo ngày** |
++| 18, 21–25 | Dashboard, đa chiều, doanh thu/dòng tiền (aggregate **riêng** từng grain), công suất (date spine), funnel | ✅ 🟡 | Kỳ báo cáo theo múi giờ cơ sở; HOST hỏi property ngoài phạm vi -> `FORBIDDEN_SCOPE`; `GET /analytics/cashflow` (UC-23); công suất có hold còn hạn + ngày thiếu giá; funnel có tỷ lệ hủy + payment attempt. **Chưa có bảng fact theo ngày** |
+ | 26 | Truy vấn động whitelist + cache + chống stampede | 🟡 | **Export bất đồng bộ (`report_job`) ❌** |
+ | 19–20 | Audit append-only (+ `attempt` REQUIRES_NEW), quản trị user/role/amenity | ✅ | Audit gọi tường minh, **không dùng AOP `@Audited`** |
+-| 27–28 | Hội thoại, tin nhắn idempotent theo `clientMessageId`, cursor, unread, phản ánh/ticket, SUPPORT nhận khi quá hạn | ✅ 🟡 | Realtime SSE/WebSocket ❌ (client poll theo `afterSeq`); đính kèm ảnh ❌; `read_receipts` gộp vào participants |
++| 27–28 | Hội thoại (khách hoặc HOST của booking mở), tin nhắn idempotent theo `clientMessageId`, cursor, unread, phản ánh/ticket, SUPPORT nhận khi quá hạn | ✅ 🟡 | Realtime SSE/WebSocket ❌ (client poll theo `afterSeq`); đính kèm ảnh ❌; `read_receipts` gộp vào participants |
+ | 30–31 | Cấu hình động; mẫu email có version bất biến, whitelist biến, escape HTML | ✅ 🟡 | "Gửi test" template ❌ |
+ | 32–34 | Email giao dịch, nhắc check-in (DST-safe, EFFECTIVE_FOR_UNSENT), theo dõi/retry an toàn | ✅ | |
+ 
+diff --git a/app-dat-phong/Dockerfile b/app-dat-phong/Dockerfile
+index 15fe2bc..8dfc5d7 100644
+--- a/app-dat-phong/Dockerfile
++++ b/app-dat-phong/Dockerfile
+@@ -7,6 +7,8 @@ RUN mvn -B package -DskipTests
+ 
+ FROM eclipse-temurin:21-jre-jammy
+ WORKDIR /app
++# healthcheck trong docker-compose dùng curl: cài tường minh, không phụ thuộc base image có sẵn hay không
++RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+ RUN useradd -r -u 1001 spring && chown spring /app
+ USER spring
+ COPY --from=build /build/target/*.jar app.jar
+diff --git a/app-dat-phong/src/main/java/datphong/vn/config/DemoDataSeeder.java b/app-dat-phong/src/main/java/datphong/vn/config/DemoDataSeeder.java
+index 7e2defb..2e887ce 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/config/DemoDataSeeder.java
++++ b/app-dat-phong/src/main/java/datphong/vn/config/DemoDataSeeder.java
+@@ -1,4 +1,4 @@
+-﻿package datphong.vn.config;
++package datphong.vn.config;
+ 
+ import datphong.vn.constant.*;
+ import datphong.vn.exception.entity.*;
+diff --git a/app-dat-phong/src/main/java/datphong/vn/config/SecurityConfig.java b/app-dat-phong/src/main/java/datphong/vn/config/SecurityConfig.java
+index 5d87e5f..f0ef222 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/config/SecurityConfig.java
++++ b/app-dat-phong/src/main/java/datphong/vn/config/SecurityConfig.java
+@@ -3,6 +3,7 @@ package datphong.vn.config;
+ import datphong.vn.security.JwtAuthenticationFilter;
+ import datphong.vn.security.RestErrorHandlers;
+ import lombok.RequiredArgsConstructor;
++import org.springframework.boot.web.servlet.FilterRegistrationBean;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.http.HttpMethod;
+@@ -35,6 +36,17 @@ public class SecurityConfig {
+         return new BCryptPasswordEncoder(11);
+     }
+ 
++    /**
++     * JwtAuthenticationFilter là @Component nên Spring Boot sẽ tự đăng ký thêm một lần ở mức servlet container.
++     * Tắt đăng ký đó: filter chỉ chạy BÊN TRONG security filter chain (đúng thứ tự, không xử lý JWT hai lần).
++     */
++    @Bean
++    public FilterRegistrationBean<JwtAuthenticationFilter> jwtFilterRegistration(JwtAuthenticationFilter f) {
++        FilterRegistrationBean<JwtAuthenticationFilter> reg = new FilterRegistrationBean<>(f);
++        reg.setEnabled(false);
++        return reg;
++    }
++
+     @Bean
+     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+         http.csrf(c -> c.disable())
+diff --git a/app-dat-phong/src/main/java/datphong/vn/controller/AdminController.java b/app-dat-phong/src/main/java/datphong/vn/controller/AdminController.java
+index 940c01b..54e5d2c 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/controller/AdminController.java
++++ b/app-dat-phong/src/main/java/datphong/vn/controller/AdminController.java
+@@ -41,6 +41,7 @@ public class AdminController {
+     private final MailAdminService mailAdmin;
+     private final ReconciliationService reconciliation;
+     private final BookingQueryService bookingQueries;
++    private final datphong.vn.service.StayService stay;
+ 
+     // ---- users / roles
+     @GetMapping("/admin/users")
+@@ -193,6 +194,28 @@ public class AdminController {
+         return Map.of("status", "RECONCILED");
+     }
+ 
++    /** UC-36: SUPPORT đối soát lại một payment chưa rõ trạng thái (hỏi bank theo idempotencyKey cũ). */
++    @PostMapping("/support/payments/{id}/reconcile")
++    @PreAuthorize("hasAuthority('SUPPORT_REFUND_RECONCILE')")
++    public Map<String, Object> reconcilePayment(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
++        return reconciliation.manualReconcilePayment(id, r.reason());
++    }
++
++    /** UC-36: tạo refund bù trừ cho ca đối soát (idempotent theo ca). */
++    @PostMapping("/support/reconciliation-cases/{id}/compensate")
++    @PreAuthorize("hasAuthority('SUPPORT_REFUND_RECONCILE')")
++    public CaseDto compensate(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
++        return reconciliation.compensate(id, CurrentUser.id(), r.reason());
++    }
++
++    /** UC-15 ngoại lệ: check-out booking chưa check-in, chỉ SUPPORT có quyền riêng + lý do + audit. */
++    @PostMapping("/support/bookings/{id}/force-checkout")
++    @PreAuthorize("hasAuthority('SUPPORT_STAY_EXCEPTION')")
++    public Map<String, String> forceCheckout(@PathVariable Long id, @Valid @RequestBody BookingRequests.SupportAction r) {
++        stay.supportForceCheckout(CurrentUser.id(), id, r.reason());
++        return Map.of("status", "COMPLETED");
++    }
++
+     @GetMapping("/support/bookings/{id}")
+     @PreAuthorize("hasAuthority('BOOKING_VIEW') and hasRole('SUPPORT')")
+     public HostBookingDto supportBooking(@PathVariable Long id) {
+diff --git a/app-dat-phong/src/main/java/datphong/vn/controller/AnalyticsController.java b/app-dat-phong/src/main/java/datphong/vn/controller/AnalyticsController.java
+index af09a9a..a95f5b6 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/controller/AnalyticsController.java
++++ b/app-dat-phong/src/main/java/datphong/vn/controller/AnalyticsController.java
+@@ -46,6 +46,14 @@ public class AnalyticsController {
+         return analytics.funnel(CurrentUser.require(), from, to, propertyId);
+     }
+ 
++    /** UC-23: dòng tiền - captured, refund succeeded/pending/failed, giao dịch đang xử lý, ca đối soát mở. */
++    @GetMapping("/cashflow")
++    public Map<String, Object> cashflow(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
++                                        @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
++                                        @RequestParam(required = false) Long propertyId) {
++        return analytics.cashflow(CurrentUser.require(), from, to, propertyId);
++    }
++
+     /** Alias theo đặc tả: GET /host/reports -> overview theo property. */
+     @GetMapping("/reports")
+     public Map<String, Object> reports(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+diff --git a/app-dat-phong/src/main/java/datphong/vn/controller/HostBookingController.java b/app-dat-phong/src/main/java/datphong/vn/controller/HostBookingController.java
+index 1a928e5..c5cdadd 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/controller/HostBookingController.java
++++ b/app-dat-phong/src/main/java/datphong/vn/controller/HostBookingController.java
+@@ -47,14 +47,14 @@ public class HostBookingController {
+         return Map.of("status", "OK");
+     }
+ 
+-    @PostMapping("/{id}/checkin")
++    @PostMapping({"/{id}/checkin", "/{id}/check-in"})
+     @PreAuthorize("hasAuthority('STAY_MANAGE')")
+     public Map<String, String> checkIn(@PathVariable Long id) {
+         stay.checkIn(CurrentUser.id(), id);
+         return Map.of("status", "CHECKED_IN");
+     }
+ 
+-    @PostMapping("/{id}/check-out")
++    @PostMapping({"/{id}/checkout", "/{id}/check-out"})
+     @PreAuthorize("hasAuthority('STAY_MANAGE')")
+     public Map<String, String> checkOut(@PathVariable Long id) {
+         stay.checkOut(CurrentUser.id(), id);
+diff --git a/app-dat-phong/src/main/java/datphong/vn/controller/MessagingController.java b/app-dat-phong/src/main/java/datphong/vn/controller/MessagingController.java
+index 6da7ebe..d47c044 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/controller/MessagingController.java
++++ b/app-dat-phong/src/main/java/datphong/vn/controller/MessagingController.java
+@@ -23,11 +23,12 @@ public class MessagingController {
+     private final ConversationService chat;
+     private final CheckinRequestService checkin;
+ 
++    /** UC-27: khách mở hội thoại với cơ sở; HOST mở hội thoại với khách của một booking thuộc cơ sở mình (bắt buộc bookingId). */
+     @PostMapping("/conversations")
+     @ResponseStatus(HttpStatus.CREATED)
+-    @PreAuthorize("hasAuthority('BOOKING_CREATE')")
++    @PreAuthorize("hasAnyAuthority('BOOKING_CREATE', 'BOOKING_UPDATE')")
+     public Map<String, Object> open(@Valid @RequestBody MessagingRequests.OpenConversation r) {
+-        return chat.open(CurrentUser.id(), r);
++        return chat.open(CurrentUser.require(), r);
+     }
+ 
+     @GetMapping("/conversations")
+@@ -94,6 +95,12 @@ public class MessagingController {
+         return view(checkin.create(CurrentUser.id(), id, r));
+     }
+ 
++    /** UC-29: tra cứu lịch đến/lịch sử đề nghị check-in của booking (khách của booking hoặc HOST sở hữu cơ sở). */
++    @GetMapping("/bookings/{id}/checkin-requests")
++    public List<Map<String, Object>> listCheckinRequests(@PathVariable Long id) {
++        return checkin.forBooking(CurrentUser.require(), id).stream().map(MessagingController::view).toList();
++    }
++
+     @PatchMapping("/checkin-requests/{id}/respond")
+     @PreAuthorize("hasAuthority('BOOKING_UPDATE')")
+     public Map<String, Object> respond(@PathVariable Long id, @Valid @RequestBody MessagingRequests.CheckinRespond r) {
+diff --git a/app-dat-phong/src/main/java/datphong/vn/exception/entity/ConfigValue.java b/app-dat-phong/src/main/java/datphong/vn/exception/entity/ConfigValue.java
+index 7f41ba7..d339884 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/exception/entity/ConfigValue.java
++++ b/app-dat-phong/src/main/java/datphong/vn/exception/entity/ConfigValue.java
+@@ -24,6 +24,9 @@ public class ConfigValue {
+     private String scopeId = "";
+     @Column(name = "cfg_value", nullable = false, length = 500)
+     private String value;
++    /** Giá trị đang hiệu lực trước khi value (lên lịch ở tương lai) có hiệu lực; null = dùng default. */
++    @Column(name = "previous_value", length = 500)
++    private String previousValue;
+     @Column(name = "effective_at", nullable = false)
+     private Instant effectiveAt;
+     @Column(nullable = false)
+diff --git a/app-dat-phong/src/main/java/datphong/vn/repository/RefundRepository.java b/app-dat-phong/src/main/java/datphong/vn/repository/RefundRepository.java
+index acda787..b512bfa 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/repository/RefundRepository.java
++++ b/app-dat-phong/src/main/java/datphong/vn/repository/RefundRepository.java
+@@ -25,8 +25,11 @@ public interface RefundRepository extends JpaRepository<Refund, Long> {
+     @Query("select r from Refund r where r.id = :id")
+     Optional<Refund> lockById(@Param("id") Long id);
+ 
+-    /** Tổng hoàn đã thành công + đang xử lý/chờ (không tính FAILED đã bỏ) của một payment. */
+-    @Query("select coalesce(sum(r.amount), 0) from Refund r where r.paymentId = :paymentId and r.status in (datphong.vn.constant.RefundStatus.REQUESTED, datphong.vn.constant.RefundStatus.PROCESSING, datphong.vn.constant.RefundStatus.SUCCEEDED)")
++    /**
++     * Tổng hoàn đã thành công + đang xử lý/chờ + FAILED (vẫn có thể được retry/đối soát với CÙNG refund_key) của một payment.
++     * Tính cả FAILED để một refund mới không bao giờ làm tổng hoàn vượt số tiền đã thu nếu refund cũ sau đó thành công.
++     */
++    @Query("select coalesce(sum(r.amount), 0) from Refund r where r.paymentId = :paymentId")
+     BigDecimal committedForPayment(@Param("paymentId") Long paymentId);
+ 
+     @Query("select coalesce(sum(r.amount), 0) from Refund r where r.bookingId = :bookingId and r.status = datphong.vn.constant.RefundStatus.SUCCEEDED")
+diff --git a/app-dat-phong/src/main/java/datphong/vn/repository/RoomAllocationRepository.java b/app-dat-phong/src/main/java/datphong/vn/repository/RoomAllocationRepository.java
+index 7c83d79..890a25b 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/repository/RoomAllocationRepository.java
++++ b/app-dat-phong/src/main/java/datphong/vn/repository/RoomAllocationRepository.java
+@@ -23,6 +23,11 @@ public interface RoomAllocationRepository extends JpaRepository<RoomAllocation,
+     @Query(value = "select count(*) > 0 from room_allocations where room_id = :roomId and active and check_out > :today", nativeQuery = true)
+     boolean existsActiveFuture(@Param("roomId") Long roomId, @Param("today") LocalDate today);
+ 
++    /** Allocation active tương lai của loại phòng có số khách vượt capacity mới (chặn giảm sức chứa sai). */
++    @Query(value = "select count(*) > 0 from room_allocations a join bookings b on b.id = a.booking_id "
++            + "where a.active and a.check_out > :today and b.room_type_id = :roomTypeId and b.guest_count > :capacity", nativeQuery = true)
++    boolean existsActiveFutureOverCapacity(@Param("roomTypeId") Long roomTypeId, @Param("capacity") int capacity, @Param("today") LocalDate today);
++
+     /** Giải phóng ĐÚNG MỘT LẦN: UPDATE có điều kiện active = true; trả số hàng đã đổi (0 nếu đã giải phóng). */
+     @Modifying(clearAutomatically = true, flushAutomatically = true)
+     @Query("update RoomAllocation a set a.active = false, a.releasedAt = :now where a.bookingId = :bookingId and a.active = true")
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/AnalyticsService.java b/app-dat-phong/src/main/java/datphong/vn/service/AnalyticsService.java
+index bb2efa6..96ccf87 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/AnalyticsService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/AnalyticsService.java
+@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
+ import datphong.vn.domain.HmacSigner;
+ import datphong.vn.exception.BusinessException;
+ import datphong.vn.exception.ErrorCode;
++import datphong.vn.config.AppProperties;
+ import datphong.vn.security.AuthUser;
+ import datphong.vn.util.Json;
+ import lombok.RequiredArgsConstructor;
+@@ -33,6 +34,7 @@ public class AnalyticsService {
+     private final NamedParameterJdbcTemplate jdbc;
+     private final CacheService cache;
+     private final ConfigService config;
++    private final AppProperties app;
+     private final Clock clock;
+ 
+     public record Scope(Long ownerId, boolean admin) {}
+@@ -67,6 +69,29 @@ public class AnalyticsService {
+         return sb.toString();
+     }
+ 
++    /**
++     * Truy vấn trực tiếp một property: HOST phải là chủ sở hữu -> nếu không, FORBIDDEN_SCOPE (UC-18/21/22 luồng ngoại lệ),
++     * thay vì trả về số liệu 0 gây hiểu nhầm. Trả về múi giờ của property để chuẩn hóa kỳ báo cáo.
++     */
++    private ZoneId resolveZone(Scope s, Long propertyId) {
++        if (propertyId == null) return ZoneId.of(app.getDefaultTimezone());
++        MapSqlParameterSource ps = new MapSqlParameterSource("pid", propertyId);
++        List<Map<String, Object>> rows = jdbc.queryForList("SELECT owner_id, timezone FROM properties WHERE id = :pid", ps);
++        if (rows.isEmpty()) {
++            if (s.admin()) throw BusinessException.notFound("Cơ sở");
++            throw BusinessException.forbidden("Cơ sở nằm ngoài phạm vi dữ liệu của bạn");
++        }
++        Map<String, Object> r = rows.get(0);
++        if (!s.admin() && !s.ownerId().equals(((Number) r.get("owner_id")).longValue())) {
++            throw BusinessException.forbidden("Cơ sở nằm ngoài phạm vi dữ liệu của bạn");
++        }
++        return ZoneId.of((String) r.get("timezone"));
++    }
++
++    private static java.sql.Timestamp startOf(LocalDate d, ZoneId zone) {
++        return java.sql.Timestamp.from(d.atStartOfDay(zone).toInstant());
++    }
++
+     private <T> T cached(String key, Class<?> unused, java.util.function.Supplier<Map<String, Object>> loader) {
+         Optional<Map<String, Object>> hit = cache.get(key, new TypeReference<Map<String, Object>>() {});
+         if (hit.isPresent()) {
+@@ -97,16 +122,19 @@ public class AnalyticsService {
+     @Transactional(readOnly = true)
+     public Map<String, Object> overview(AuthUser u, LocalDate from, LocalDate to, Long propertyId, boolean comparePrevious) {
+         checkRange(from, to);
+-        String key = "an:v3:" + scopeHash(u) + ":ov:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId + "|" + comparePrevious).substring(0, 16);
++        Scope sc = scope(u);
++        ZoneId zone = resolveZone(sc, propertyId);
++        String key = "an:v4:" + scopeHash(u) + ":ov:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId + "|" + comparePrevious + "|" + zone).substring(0, 16);
+         return cached(key, Map.class, () -> {
+-            Scope s = scope(u);
+-            Map<String, Object> cur = overviewPeriod(s, from, to, propertyId);
++            Scope s = sc;
++            Map<String, Object> cur = overviewPeriod(s, from, to, propertyId, zone);
+             Map<String, Object> out = new LinkedHashMap<>();
+-            out.put("period", Map.of("from", from.toString(), "to", to.toString(), "semantics", "[from,to) - booking theo created_at, tiền theo captured_at/refund succeeded_at, đêm theo stay_date"));
++            out.put("period", Map.of("from", from.toString(), "to", to.toString(), "timezone", zone.getId(),
++                    "semantics", "[from,to) theo múi giờ " + zone.getId() + " - booking theo created_at, tiền theo captured_at/refund succeeded_at, đêm theo stay_date"));
+             out.put("metrics", cur);
+             if (comparePrevious) {
+                 long days = ChronoUnit.DAYS.between(from, to);   // kỳ trước cùng độ dài (cùng số ngày), nêu rõ quy ước
+-                Map<String, Object> prev = overviewPeriod(s, from.minusDays(days), from, propertyId);
++                Map<String, Object> prev = overviewPeriod(s, from.minusDays(days), from, propertyId, zone);
+                 out.put("previous", prev);
+                 out.put("deltaNetCash", ((BigDecimal) cur.get("netCash")).subtract((BigDecimal) prev.get("netCash")));
+                 out.put("comparisonRule", "kỳ trước = " + days + " ngày liền trước, cùng quy ước thời gian");
+@@ -118,9 +146,10 @@ public class AnalyticsService {
+         });
+     }
+ 
+-    private Map<String, Object> overviewPeriod(Scope s, LocalDate from, LocalDate to, Long propertyId) {
+-        Instant f = from.atStartOfDay(ZoneOffset.UTC).toInstant();
+-        Instant t = to.atStartOfDay(ZoneOffset.UTC).toInstant();
++    private Map<String, Object> overviewPeriod(Scope s, LocalDate from, LocalDate to, Long propertyId, ZoneId zone) {
++        // ranh giới ngày theo múi giờ cơ sở (hoặc múi giờ mặc định của hệ thống khi gộp nhiều cơ sở), không theo UTC
++        Instant f = from.atStartOfDay(zone).toInstant();
++        Instant t = to.atStartOfDay(zone).toInstant();
+         // 1) booking: grain = 1 dòng / booking
+         MapSqlParameterSource p1 = new MapSqlParameterSource("f", java.sql.Timestamp.from(f)).addValue("t", java.sql.Timestamp.from(t));
+         String sc1 = scopeSql(s, p1, propertyId, "p");
+@@ -191,7 +220,14 @@ public class AnalyticsService {
+         String axisName = r.timeAxis() == null ? "checkIn" : r.timeAxis();
+         String axis = TIME_AXIS.get(axisName);
+         if (axis == null) throw new BusinessException(ErrorCode.VALIDATION_ERROR, "timeAxis bắt buộc là một trong " + TIME_AXIS.keySet());
+-        int limit = Math.min(r.limit() == null ? 200 : r.limit(), 1000);
++        if (r.limit() != null && (r.limit() < 1 || r.limit() > 1000)) throw BusinessException.validation("limit phải trong khoảng 1..1000");
++        int limit = r.limit() == null ? 200 : r.limit();
++        if (r.statuses() != null) {
++            for (String st : r.statuses()) {
++                try { datphong.vn.constant.BookingStatus.valueOf(st); } catch (Exception e) { throw BusinessException.validation("status không hợp lệ: " + st); }
++            }
++        }
++        resolveZone(scope(u), r.propertyId());   // HOST hỏi property ngoài phạm vi -> FORBIDDEN_SCOPE
+         String key = "an:v3:" + scopeHash(u) + ":q:" + HmacSigner.sha256Hex(Json.write(r)).substring(0, 20);
+         return cached(key, Map.class, () -> {
+             MapSqlParameterSource ps = new MapSqlParameterSource("from", r.from()).addValue("to", r.to());
+@@ -227,7 +263,8 @@ public class AnalyticsService {
+     @Transactional(readOnly = true)
+     public Map<String, Object> occupancy(AuthUser u, LocalDate from, LocalDate to, Long propertyId) {
+         checkRange(from, to);
+-        String key = "an:v3:" + scopeHash(u) + ":occ:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId).substring(0, 16);
++        resolveZone(scope(u), propertyId);
++        String key = "an:v4:" + scopeHash(u) + ":occ:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId).substring(0, 16);
+         return cached(key, Map.class, () -> {
+             MapSqlParameterSource ps = new MapSqlParameterSource("from", from).addValue("to", to);
+             String sc = scopeSql(scope(u), ps, propertyId, "p");
+@@ -236,23 +273,33 @@ public class AnalyticsService {
+                     "SELECT d::date AS day, COUNT(r.id) AS sellable, "
+                             + "COUNT(r.id) FILTER (WHERE EXISTS (SELECT 1 FROM bookings b WHERE b.room_id = r.id AND b.status IN ('CONFIRMED','CHECKED_IN','COMPLETED') "
+                             + "AND b.check_in <= d::date AND b.check_out > d::date)) AS occupied, "
++                            + "COUNT(r.id) FILTER (WHERE EXISTS (SELECT 1 FROM bookings b WHERE b.room_id = r.id AND b.status = 'PENDING_PAYMENT' "
++                            + "AND b.expires_at > now() AND b.check_in <= d::date AND b.check_out > d::date)) AS held, "
++                            + "COUNT(DISTINCT r.room_type_id) FILTER (WHERE NOT EXISTS (SELECT 1 FROM room_rates rr WHERE rr.room_type_id = r.room_type_id "
++                            + "AND rr.stay_date = d::date)) AS types_missing_rate, "
+                             + "COALESCE(SUM(b2.rate),0) AS room_revenue "
+                             + "FROM generate_series(CAST(:from AS date), CAST(:to AS date) - 1, interval '1 day') d "
+                             + "CROSS JOIN rooms r JOIN properties p ON p.id = r.property_id "
+                             + "LEFT JOIN LATERAL (SELECT n.nightly_rate AS rate FROM booking_nights n JOIN bookings bb ON bb.id = n.booking_id "
+                             + "WHERE bb.room_id = r.id AND n.stay_date = d::date AND bb.status IN ('CONFIRMED','CHECKED_IN','COMPLETED')) b2 ON TRUE "
+                             + "WHERE r.status = 'ACTIVE' AND p.status IN ('PUBLISHED','PAUSED')" + sc + " GROUP BY d ORDER BY d", ps);
+-            long sellable = 0, occupied = 0;
++            long sellable = 0, occupied = 0, held = 0;
++            List<String> missingRateDays = new ArrayList<>();
+             BigDecimal revenue = BigDecimal.ZERO;
+             List<Map<String, Object>> heat = new ArrayList<>();
+             for (Map<String, Object> d : days) {
+                 long s = ((Number) d.get("sellable")).longValue(), o = ((Number) d.get("occupied")).longValue();
+                 BigDecimal rev = (BigDecimal) d.get("room_revenue");
+-                sellable += s; occupied += o; revenue = revenue.add(rev);
++                long hd = ((Number) d.get("held")).longValue();
++                long miss = ((Number) d.get("types_missing_rate")).longValue();
++                sellable += s; occupied += o; held += hd; revenue = revenue.add(rev);
++                if (miss > 0) missingRateDays.add(d.get("day").toString());
+                 Map<String, Object> h = new LinkedHashMap<>();
+                 h.put("day", d.get("day").toString());
+                 h.put("sellableRoomNights", s);
+                 h.put("occupiedRoomNights", o);
++                h.put("heldRoomNights", hd);                 // hold còn hạn: chiếm tồn kho nhưng chưa phải đêm bán
++                h.put("roomTypesMissingRate", miss);         // thiếu giá: đánh dấu, không tự suy diễn
+                 h.put("occupancy", s == 0 ? null : BigDecimal.valueOf(o).divide(BigDecimal.valueOf(s), 4, java.math.RoundingMode.HALF_UP)); // mẫu số 0 -> null, không hiển thị 0% sai nghĩa
+                 heat.add(h);
+             }
+@@ -260,6 +307,8 @@ public class AnalyticsService {
+             out.put("days", heat);
+             out.put("occupiedRoomNights", occupied);
+             out.put("sellableRoomNights", sellable);
++            out.put("heldRoomNights", held);
++            out.put("daysMissingRate", missingRateDays);
+             // tổng hợp = tổng tử / tổng mẫu (không trung bình % từng ngày/property)
+             out.put("occupancy", sellable == 0 ? null : BigDecimal.valueOf(occupied).divide(BigDecimal.valueOf(sellable), 4, java.math.RoundingMode.HALF_UP));
+             out.put("adr", occupied == 0 ? null : revenue.divide(BigDecimal.valueOf(occupied), 0, java.math.RoundingMode.HALF_UP));
+@@ -276,10 +325,10 @@ public class AnalyticsService {
+     @Transactional(readOnly = true)
+     public Map<String, Object> funnel(AuthUser u, LocalDate from, LocalDate to, Long propertyId) {
+         checkRange(from, to);
+-        String key = "an:v3:" + scopeHash(u) + ":fn:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId).substring(0, 16);
++        ZoneId zone = resolveZone(scope(u), propertyId);
++        String key = "an:v4:" + scopeHash(u) + ":fn:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId + "|" + zone).substring(0, 16);
+         return cached(key, Map.class, () -> {
+-            MapSqlParameterSource ps = new MapSqlParameterSource("f", java.sql.Timestamp.from(from.atStartOfDay(ZoneOffset.UTC).toInstant()))
+-                    .addValue("t", java.sql.Timestamp.from(to.atStartOfDay(ZoneOffset.UTC).toInstant()));
++            MapSqlParameterSource ps = new MapSqlParameterSource("f", startOf(from, zone)).addValue("t", startOf(to, zone));
+             String sc = scopeSql(scope(u), ps, propertyId, "p");
+             // mỗi (bước, ref/session) chỉ đếm MỘT lần dù event bị gửi lại; không chứa PII
+             List<Map<String, Object>> steps = jdbc.queryForList("SELECT e.event_type AS step, COUNT(DISTINCT COALESCE(e.ref_id, e.session_key, e.event_id)) AS n "
+@@ -300,11 +349,28 @@ public class AnalyticsService {
+                 funnel.add(m);
+                 prev = n;
+             }
++            // hủy: số booking tạo trong kỳ bị hủy / tổng booking tạo trong kỳ (cùng phạm vi, cùng grain booking)
++            Map<String, Object> cancel = jdbc.queryForMap("SELECT COUNT(*) AS created, COUNT(*) FILTER (WHERE b.status IN ('CANCELLED','REFUND_PENDING')) AS cancelled, "
++                    + "COUNT(*) FILTER (WHERE b.status IN ('EXPIRED','NEEDS_ATTENTION')) AS expired "
++                    + "FROM bookings b JOIN properties p ON p.id = b.property_id WHERE b.created_at >= :f AND b.created_at < :t" + sc, ps);
++            long createdB = ((Number) cancel.get("created")).longValue();
++            long cancelledB = ((Number) cancel.get("cancelled")).longValue();
++            Map<String, Object> cancellation = new LinkedHashMap<>();
++            cancellation.put("bookingsCreated", createdB);
++            cancellation.put("bookingsCancelled", cancelledB);
++            cancellation.put("bookingsExpired", ((Number) cancel.get("expired")).longValue());
++            cancellation.put("cancellationRate", createdB == 0 ? null : BigDecimal.valueOf(cancelledB).divide(BigDecimal.valueOf(createdB), 4, java.math.RoundingMode.HALF_UP));
++            // payment attempt là đại lượng KHÁC booking: đếm riêng theo trạng thái payment (grain = payment)
++            List<Map<String, Object>> attempts = jdbc.queryForList("SELECT pay.status AS status, COUNT(*) AS n FROM payments pay JOIN bookings b ON b.id = pay.booking_id "
++                    + "JOIN properties p ON p.id = b.property_id WHERE pay.created_at >= :f AND pay.created_at < :t" + sc + " GROUP BY pay.status ORDER BY pay.status", ps);
+             List<Map<String, Object>> failures = jdbc.queryForList("SELECT COALESCE(e.code,'UNKNOWN') AS code, COUNT(DISTINCT e.event_id) AS n FROM business_events e JOIN properties p ON p.id = e.property_id "
+                     + "WHERE e.event_type = 'PAYMENT_FAILED' AND e.event_time >= :f AND e.event_time < :t" + sc + " GROUP BY e.code ORDER BY n DESC", ps);
+             Map<String, Object> out = new LinkedHashMap<>();
+             out.put("funnel", funnel);
+             out.put("paymentFailuresByCode", failures);
++            out.put("cancellation", cancellation);
++            out.put("paymentAttemptsByStatus", attempts);
++            out.put("timezone", zone.getId());
+             out.put("coverageNote", "Funnel chỉ dựa trên event log (business_events); nếu event bị mất thì tỷ lệ chỉ phản ánh phần đã ghi nhận. Mẫu nhỏ -> tránh kết luận.");
+             out.put("firstStepSample", first);
+             out.put("asOf", clock.instant().toString());
+@@ -312,4 +378,56 @@ public class AnalyticsService {
+             return out;
+         });
+     }
++
++    // ------------------------------------------------------------------ UC-23 dòng tiền / hoàn tiền / đối soát
++    @Transactional(readOnly = true)
++    public Map<String, Object> cashflow(AuthUser u, LocalDate from, LocalDate to, Long propertyId) {
++        checkRange(from, to);
++        Scope sc = scope(u);
++        ZoneId zone = resolveZone(sc, propertyId);
++        String key = "an:v4:" + scopeHash(u) + ":cf:" + HmacSigner.sha256Hex(from + "|" + to + "|" + propertyId + "|" + zone).substring(0, 16);
++        return cached(key, Map.class, () -> {
++            MapSqlParameterSource ps = new MapSqlParameterSource("f", startOf(from, zone)).addValue("t", startOf(to, zone));
++            String scSql = scopeSql(sc, ps, propertyId, "p");
++            // payment: grain = payment. Thành công theo captured_at; đang xử lý/thất bại theo created_at
++            Map<String, Object> pay = jdbc.queryForMap("SELECT "
++                    + "COALESCE(SUM(pay.amount) FILTER (WHERE pay.status = 'SUCCEEDED' AND pay.captured_at >= :f AND pay.captured_at < :t),0) AS captured, "
++                    + "COUNT(*) FILTER (WHERE pay.status = 'SUCCEEDED' AND pay.captured_at >= :f AND pay.captured_at < :t) AS captured_cnt, "
++                    + "COALESCE(SUM(pay.amount) FILTER (WHERE pay.status IN ('INITIATED','PROCESSING','UNKNOWN','TIMED_OUT') AND pay.created_at >= :f AND pay.created_at < :t),0) AS in_flight, "
++                    + "COUNT(*) FILTER (WHERE pay.status IN ('INITIATED','PROCESSING','UNKNOWN','TIMED_OUT') AND pay.created_at >= :f AND pay.created_at < :t) AS in_flight_cnt, "
++                    + "COUNT(*) FILTER (WHERE pay.status = 'FAILED' AND pay.created_at >= :f AND pay.created_at < :t) AS failed_cnt "
++                    + "FROM payments pay JOIN bookings b ON b.id = pay.booking_id JOIN properties p ON p.id = b.property_id WHERE 1=1" + scSql, ps);
++            // refund: grain = refund. Thành công theo succeeded_at; pending/failed theo created_at, KHÔNG trừ vào thực thu
++            Map<String, Object> ref = jdbc.queryForMap("SELECT "
++                    + "COALESCE(SUM(r.amount) FILTER (WHERE r.status = 'SUCCEEDED' AND r.succeeded_at >= :f AND r.succeeded_at < :t),0) AS refunded, "
++                    + "COUNT(*) FILTER (WHERE r.status = 'SUCCEEDED' AND r.succeeded_at >= :f AND r.succeeded_at < :t) AS refunded_cnt, "
++                    + "COALESCE(SUM(r.amount) FILTER (WHERE r.status IN ('REQUESTED','PROCESSING') AND r.created_at >= :f AND r.created_at < :t),0) AS pending, "
++                    + "COALESCE(SUM(r.amount) FILTER (WHERE r.status = 'FAILED' AND r.created_at >= :f AND r.created_at < :t),0) AS failed "
++                    + "FROM refunds r JOIN bookings b ON b.id = r.booking_id JOIN properties p ON p.id = b.property_id WHERE 1=1" + scSql, ps);
++            List<Map<String, Object>> cases = jdbc.queryForList("SELECT c.type AS type, COUNT(*) AS open_cases FROM reconciliation_cases c "
++                    + "JOIN bookings b ON b.id = c.booking_id JOIN properties p ON p.id = b.property_id WHERE c.status = 'OPEN'" + scSql
++                    + " GROUP BY c.type ORDER BY c.type", ps);
++            BigDecimal captured = (BigDecimal) pay.get("captured");
++            BigDecimal refunded = (BigDecimal) ref.get("refunded");
++            Map<String, Object> out = new LinkedHashMap<>();
++            out.put("period", Map.of("from", from.toString(), "to", to.toString(), "timezone", zone.getId(),
++                    "semantics", "captured theo captured_at, refund theo succeeded_at, giao dịch đang xử lý/thất bại theo created_at"));
++            out.put("currency", "VND");
++            out.put("capturedAmount", captured);
++            out.put("capturedPayments", ((Number) pay.get("captured_cnt")).longValue());
++            out.put("inFlightAmount", pay.get("in_flight"));
++            out.put("inFlightPayments", ((Number) pay.get("in_flight_cnt")).longValue());
++            out.put("failedPayments", ((Number) pay.get("failed_cnt")).longValue());
++            out.put("refundSucceededAmount", refunded);
++            out.put("refundSucceededCount", ((Number) ref.get("refunded_cnt")).longValue());
++            out.put("refundPendingAmount", ref.get("pending"));
++            out.put("refundFailedAmount", ref.get("failed"));
++            out.put("netCollected", captured.subtract(refunded));      // thực thu = captured - refund succeeded
++            out.put("openReconciliationCases", cases);
++            out.put("reconciliationStatus", cases.isEmpty() ? "CLEAN" : "NEEDS_ATTENTION");
++            out.put("asOf", clock.instant().toString());
++            out.put("sourceType", "LIVE");
++            return out;
++        });
++    }
+ }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/AuthService.java b/app-dat-phong/src/main/java/datphong/vn/service/AuthService.java
+index 9aa2c2f..2f5c4b8 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/AuthService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/AuthService.java
+@@ -153,8 +153,9 @@ public class AuthService {
+         User u = users.findWithAuthoritiesByEmail(email).orElse(null);
+         Instant now = clock.instant();
+         if (u == null) {
+-            encoder.matches(req.password(), "$2a$11$0000000000000000000000000000000000000000000000000000"); // làm đều thời gian
++            encoder.matches(req.password(), dummyHash()); // làm đều thời gian (hash BCrypt hợp lệ, cùng cost) -> không lộ email tồn tại
+             log.info("login failure (unknown email) ip={}", ip);
++            audit.record("LOGIN_FAILURE", "USER", null, null, null, "UNKNOWN_EMAIL", Map.of("ip", String.valueOf(ip)));
+             throw new BusinessException(ErrorCode.UNAUTHORIZED, "Thông tin đăng nhập không chính xác");
+         }
+         if (u.getLockedUntil() != null && u.getLockedUntil().isAfter(now)) {
+@@ -167,6 +168,7 @@ public class AuthService {
+                 u.setFailedLoginCount(0);
+             }
+             log.info("login failure userId={} ip={}", u.getId(), ip);
++            audit.record("LOGIN_FAILURE", "USER", u.getId(), null, null, "BAD_CREDENTIALS", Map.of("ip", String.valueOf(ip)));
+             throw new BusinessException(ErrorCode.UNAUTHORIZED, "Thông tin đăng nhập không chính xác");
+         }
+         if (u.getStatus() == UserStatus.PENDING_VERIFICATION) {
+@@ -178,6 +180,7 @@ public class AuthService {
+         u.setFailedLoginCount(0);
+         u.setLockedUntil(null);
+         log.info("login success userId={} traceId={}", u.getId(), MDC.get("traceId"));
++        audit.record("LOGIN_SUCCESS", "USER", u.getId(), null, null, null, Map.of("ip", String.valueOf(ip)));
+         return issueTokens(u, Texts.uuid(), device);
+     }
+ 
+@@ -218,6 +221,19 @@ public class AuthService {
+             u.setTokenVersion(u.getTokenVersion() + 1);   // access token đang sống bị từ chối ngay
+             refreshTokens.revokeAllForUser(userId, now);
+         }
++        audit.record("LOGOUT", "USER", userId, null, null, null, Map.of("allDevices", req.allDevices()));
++    }
++
++    private volatile String dummyHash;
++
++    /** Hash BCrypt hợp lệ (tính một lần) để so khớp giả khi email không tồn tại: cùng chi phí với hash thật. */
++    private String dummyHash() {
++        String h = dummyHash;
++        if (h == null) {
++            h = encoder.encode(Texts.randomToken(24));
++            dummyHash = h;
++        }
++        return h;
+     }
+ 
+     private AuthResponses.Tokens issueTokens(User u, String familyId, String device) {
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/BookingCreator.java b/app-dat-phong/src/main/java/datphong/vn/service/BookingCreator.java
+index fc9eaa2..045c1a0 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/BookingCreator.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/BookingCreator.java
+@@ -52,15 +52,17 @@ public class BookingCreator {
+     public Result create(Long customerId, BookingRequests.Create req, String requestHash) {
+         String scope = "booking:create:" + customerId;
+ 
++        // Idempotency kiểm tra TRƯỚC mọi validate: cùng key + cùng payload luôn trả lại kết quả cũ,
++        // kể cả khi sau đó phòng/cơ sở đã đổi trạng thái hoặc ngày nhận phòng đã qua.
++        var replay = idempotency.lookup(scope, req.idempotencyKey(), requestHash);
++        if (replay.isPresent()) return new Result(bookings.findById(Long.valueOf(replay.get())).orElseThrow(), true);
++
+         Room room = rooms.findById(req.roomId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
+         Property property = properties.findById(room.getPropertyId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
+         RoomType type = roomTypes.findById(room.getRoomTypeId()).orElseThrow();
+         if (property.getStatus() != PropertyStatus.PUBLISHED) throw new BusinessException(ErrorCode.ROOM_UNAVAILABLE, "Cơ sở không mở bán");
+         StayPeriod period = pricing.validateStay(property, type, req.checkIn(), req.checkOut(), req.guestCount());
+ 
+-        var replay = idempotency.lookup(scope, req.idempotencyKey(), requestHash);
+-        if (replay.isPresent()) return new Result(bookings.findById(Long.valueOf(replay.get())).orElseThrow(), true);
+-
+         // (1) khóa phòng - các request cạnh tranh cùng phòng được tuần tự hóa tại đây
+         Room locked = rooms.lockById(req.roomId()).orElseThrow(() -> BusinessException.notFound("Phòng"));
+         // Re-check sau khi lấy khóa: request trùng key có thể vừa commit trong lúc ta chờ khóa; trạng thái phòng có thể vừa đổi.
+@@ -78,9 +80,12 @@ public class BookingCreator {
+ 
+         // Giá/chính sách hiện hành đọc TRONG transaction, server tự tính tiền
+         PricingCalculator.Quote q = pricing.price(type, period);
+-        if (req.expectedTotal() != null && req.expectedTotal().compareTo(q.total()) != 0) {
++        String currentPriceVersion = pricing.priceVersion(q);
++        boolean totalChanged = req.expectedTotal() != null && req.expectedTotal().compareTo(q.total()) != 0;
++        boolean versionChanged = req.priceVersion() != null && !req.priceVersion().isBlank() && !req.priceVersion().equals(currentPriceVersion);
++        if (totalChanged || versionChanged) {
+             throw new BusinessException(ErrorCode.PRICE_CHANGED, "Giá đã thay đổi so với báo giá",
+-                    Map.of("newTotal", q.total(), "priceVersion", pricing.priceVersion(q)));
++                    Map.of("newTotal", q.total(), "priceVersion", currentPriceVersion));
+         }
+ 
+         Booking b = new Booking();
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/BookingQueryService.java b/app-dat-phong/src/main/java/datphong/vn/service/BookingQueryService.java
+index 491f6c4..72e5164 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/BookingQueryService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/BookingQueryService.java
+@@ -58,6 +58,9 @@ public class BookingQueryService {
+     /** HOST: owner scope được ÉP trong SQL (JOIN properties ... owner_id), không lọc sau ở tầng Java. */
+     @Transactional(readOnly = true)
+     public Page<BookingDto> hostList(Long ownerId, Long propertyId, BookingStatus status, LocalDate from, LocalDate to, int page, int size) {
++        if (propertyId != null && properties.findByIdAndOwnerId(propertyId, ownerId).isEmpty()) {
++            throw BusinessException.forbidden("Cơ sở không thuộc phạm vi quản lý của bạn");   // UC-14: lọc property ngoài scope
++        }
+         StringBuilder where = new StringBuilder(" WHERE p.owner_id = :owner");
+         MapSqlParameterSource ps = new MapSqlParameterSource("owner", ownerId);
+         if (propertyId != null) { where.append(" AND b.property_id = :pid"); ps.addValue("pid", propertyId); }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/BusinessEventService.java b/app-dat-phong/src/main/java/datphong/vn/service/BusinessEventService.java
+index 4c8fc5a..c159434 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/BusinessEventService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/BusinessEventService.java
+@@ -1,58 +1,59 @@
+ package datphong.vn.service;
+ 
+-import datphong.vn.exception.entity.BusinessEvent;
+-import datphong.vn.repository.BusinessEventRepository;
+ import lombok.RequiredArgsConstructor;
+ import lombok.extern.slf4j.Slf4j;
++import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Propagation;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.sql.Timestamp;
+ import java.time.Clock;
++import java.time.Instant;
+ import java.util.UUID;
+ 
+ /**
+  * Event log analytics append-only (UC-25). Ghi theo kiểu best-effort: lỗi ghi event KHÔNG được làm hỏng nghiệp vụ,
+  * nên analytics phải công bố coverage thay vì suy diễn funnel từ riêng bảng booking.
+  * event_id unique: nghiệp vụ truyền eventId xác định (vd. PAYMENT_CAPTURED:{paymentId}) thì retry không đếm trùng.
++ *
++ * NOT_SUPPORTED + INSERT ... ON CONFLICT DO NOTHING ở chế độ autocommit: không tham gia transaction của caller
++ * (không ghi vào transaction read-only, không giữ lock chung) và KHÔNG có commit nào có thể ném lỗi ngược về nghiệp vụ.
++ * (Bản cũ dùng REQUIRES_NEW + JPA save: vi phạm unique event_id khi hai luồng ghi cùng lúc nổ ở lúc commit, ngoài try/catch,
++ * làm hỏng cả giao dịch thanh toán/booking đang gọi.)
+  */
+ @Slf4j
+ @Service
+ @RequiredArgsConstructor
+ public class BusinessEventService {
+ 
+-    private final BusinessEventRepository repo;
++    private static final String SQL = "INSERT INTO business_events (event_id, event_type, property_id, session_key, ref_id, code, event_time, ingested_at) "
++            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING";
++
++    private final JdbcTemplate jdbc;
+     private final Clock clock;
+ 
+-    /**
+-     * Cả hai overload đều REQUIRES_NEW và KHÔNG gọi lẫn nhau (self-invocation sẽ bỏ qua proxy): event được ghi trong
+-     * transaction riêng, nên không bao giờ ghi vào transaction read-only của caller và lỗi ghi event không làm hỏng nghiệp vụ.
+-     */
+-    @Transactional(propagation = Propagation.REQUIRES_NEW)
++    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+     public void record(String type, Long propertyId, String sessionKey, String refId, String code) {
+         insert(type + ":" + UUID.randomUUID(), type, propertyId, sessionKey, refId, code);
+     }
+ 
+-    @Transactional(propagation = Propagation.REQUIRES_NEW)
++    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+     public void record(String eventId, String type, Long propertyId, String sessionKey, String refId, String code) {
+         insert(eventId, type, propertyId, sessionKey, refId, code);
+     }
+ 
+     private void insert(String eventId, String type, Long propertyId, String sessionKey, String refId, String code) {
+         try {
+-            if (repo.existsByEventId(eventId)) return;
+-            BusinessEvent e = new BusinessEvent();
+-            e.setEventId(eventId);
+-            e.setEventType(type);
+-            e.setPropertyId(propertyId);
+-            e.setSessionKey(sessionKey);
+-            e.setRefId(refId);
+-            e.setCode(code);
+-            e.setEventTime(clock.instant());
+-            e.setIngestedAt(clock.instant());
+-            repo.save(e);
++            Instant now = clock.instant();
++            jdbc.update(SQL, cut(eventId, 80), cut(type, 40), propertyId, cut(sessionKey, 80), cut(refId, 60), cut(code, 60),
++                    Timestamp.from(now), Timestamp.from(now));
+         } catch (Exception ex) {
+             log.warn("business event {} dropped: {}", type, ex.getMessage());
+         }
+     }
++
++    private static String cut(String s, int max) {
++        return s == null ? null : s.substring(0, Math.min(max, s.length()));
++    }
+ }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/CancellationService.java b/app-dat-phong/src/main/java/datphong/vn/service/CancellationService.java
+index bbc02cb..934c34d 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/CancellationService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/CancellationService.java
+@@ -56,8 +56,10 @@ public class CancellationService {
+     @Transactional(readOnly = true)
+     public CancelPreview preview(AuthUser u, Long id) {
+         Booking b = scoped(u, bookings.findById(id).orElseThrow(() -> BusinessException.notFound("Booking")));
+-        BigDecimal captured = payments.capturedForBooking(id);
+-        BigDecimal refunded = refundRepo.committedForPayment(latestSucceeded(id) == null ? -1L : latestSucceeded(id).getId());
++        // Cùng công thức với cancel(): dựa trên payment SUCCEEDED gần nhất của booking (khoản sẽ được hoàn khi hủy)
++        Payment paid = latestSucceeded(id);
++        BigDecimal captured = paid == null ? Money.zero() : paid.getAmount();
++        BigDecimal refunded = paid == null ? Money.zero() : refundRepo.committedForPayment(paid.getId());
+         var res = CancellationCalculator.compute(clock.instant(), b.getFreeCancelDeadline(), b.getPenaltyPercent(), captured, refunded);
+         return new CancelPreview(id, res.freeCancellation(), captured, res.fee(), res.refundable(), b.getFreeCancelDeadline(), b.getPenaltyPercent(), b.getStatus().name());
+     }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/CatalogService.java b/app-dat-phong/src/main/java/datphong/vn/service/CatalogService.java
+index c5bc496..4e2e15a 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/CatalogService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/CatalogService.java
+@@ -204,14 +204,14 @@ public class CatalogService {
+     @Transactional
+     public RoomTypeDto updateRoomType(Long ownerId, Long typeId, CatalogRequests.RoomTypeUpsert r) {
+         RoomType t = roomTypes.findById(typeId).orElseThrow(() -> BusinessException.forbidden("Loại phòng không thuộc quyền của bạn"));
+-        owned(ownerId, t.getPropertyId());
++        Property owner = owned(ownerId, t.getPropertyId());
++        if (owner.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
+         if (r.version() != null && r.version() != t.getVersion()) throw new BusinessException(ErrorCode.VERSION_CONFLICT, "Dữ liệu đã thay đổi, hãy tải lại");
+         if (r.capacity() < t.getCapacity()) {
+-            // Giảm sức chứa: không được làm vi phạm booking tương lai đã nhận khách
+-            for (Room room : rooms.findByPropertyIdOrderByRoomCode(t.getPropertyId())) {
+-                if (room.getRoomTypeId().equals(typeId) && allocations.existsActiveFuture(room.getId(), LocalDate.now(clock))) {
+-                    throw new BusinessException(ErrorCode.ROOM_HAS_FUTURE_BOOKINGS, "Loại phòng còn booking tương lai, không thể giảm sức chứa");
+-                }
++            // Giảm sức chứa: không được làm vi phạm booking/hold tương lai có số khách vượt sức chứa mới (ngày tính theo múi giờ cơ sở)
++            if (bookingsOverCapacity(typeId, r.capacity(), today(owner))) {
++                throw new BusinessException(ErrorCode.ROOM_HAS_FUTURE_BOOKINGS,
++                        "Loại phòng còn booking/giữ chỗ tương lai có số khách vượt sức chứa mới, không thể giảm sức chứa");
+             }
+         }
+         applyType(t, r);
+@@ -239,6 +239,7 @@ public class CatalogService {
+     @Transactional
+     public RoomDto createRoom(Long ownerId, CatalogRequests.RoomCreate r) {
+         Property p = owned(ownerId, r.propertyId());
++        if (p.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
+         RoomType t = roomTypes.findByIdAndPropertyId(r.roomTypeId(), p.getId())
+                 .orElseThrow(() -> BusinessException.validation("Loại phòng không thuộc cơ sở"));
+         if (rooms.existsByPropertyIdAndRoomCode(p.getId(), r.roomCode())) {
+@@ -292,7 +293,9 @@ public class CatalogService {
+     public int upsertRates(Long ownerId, CatalogRequests.RateUpsert r) {
+         RoomType t = roomTypes.findById(r.roomTypeId()).orElseThrow(() -> BusinessException.forbidden("Loại phòng không thuộc quyền của bạn"));
+         Property p = owned(ownerId, t.getPropertyId());
++        if (p.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
+         if (!r.to().isAfter(r.from())) throw BusinessException.validation("to phải sau from");
++        if (r.amount().signum() < 0) throw BusinessException.validation("Giá không được âm");
+         if (r.from().isBefore(today(p))) throw BusinessException.validation("Không đổi giá cho ngày đã qua");
+         if (r.from().plusDays(366).isBefore(r.to())) throw BusinessException.validation("Tối đa 366 đêm mỗi lần");
+ 
+@@ -330,6 +333,11 @@ public class CatalogService {
+         return rates.findRange(roomTypeId, from, to).stream().map(x -> new RateDto(x.getStayDate(), x.getAmount(), x.getCurrency())).toList();
+     }
+ 
++    /** Có booking/hold đang chiếm phòng (allocation active, chưa trả phòng) thuộc loại phòng này với số khách > capacity mới không. */
++    private boolean bookingsOverCapacity(Long roomTypeId, int newCapacity, LocalDate today) {
++        return allocations.existsActiveFutureOverCapacity(roomTypeId, newCapacity, today);
++    }
++
+     // ------------------------------------------------------------ mapping
+     private static boolean isBlank(String s) {
+         return s == null || s.isBlank();
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/CheckinRequestService.java b/app-dat-phong/src/main/java/datphong/vn/service/CheckinRequestService.java
+index 1dc1a84..9f4bd18 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/CheckinRequestService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/CheckinRequestService.java
+@@ -9,6 +9,7 @@ import datphong.vn.exception.BusinessException;
+ import datphong.vn.exception.ErrorCode;
+ import datphong.vn.exception.entity.*;
+ import datphong.vn.repository.*;
++import datphong.vn.security.AuthUser;
+ import lombok.RequiredArgsConstructor;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -83,7 +84,8 @@ public class CheckinRequestService {
+         return cr;
+     }
+ 
+-    @Transactional
++    /** noRollbackFor: khi booking không còn hiệu lực, việc đóng yêu cầu (CLOSED) phải được lưu dù trả lỗi cho HOST. */
++    @Transactional(noRollbackFor = BusinessException.class)
+     public CheckinRequest respond(Long ownerId, Long requestId, MessagingRequests.CheckinRespond r) {
+         CheckinRequest cr = requests.findById(requestId).orElseThrow(() -> BusinessException.notFound("Yêu cầu check-in"));
+         Booking b = bookings.lockById(cr.getBookingId()).orElseThrow();
+@@ -130,11 +132,24 @@ public class CheckinRequestService {
+         if (b.getStatus() != BookingStatus.CONFIRMED) throw BusinessException.conflict("Booking không còn hiệu lực");
+         cr.setStatus(CheckinRequestStatus.ACCEPTED);
+         requests.saveAndFlush(cr);
++        // Thông báo kết quả cho HOST (UC-29 bước 184) + lưu vết trong hội thoại
++        if (cr.getConversationId() != null) {
++            Conversation locked = conversations.lockById(cr.getConversationId()).orElseThrow();
++            chat.appendMessage(locked, customerId, MessageType.CHECKIN_REQUEST,
++                    "Khách đồng ý giờ nhận phòng " + cr.getAgreedCheckinAt(), "cin-accept-" + cr.getId());
++        }
++        outbox.publish("CHECKIN_REQUEST_ACCEPTED:" + cr.getId(), "CHECKIN_REQUEST_ACCEPTED", "CHECKIN_REQUEST", cr.getId(), Map.of("bookingId", b.getId()));
++        audit.record("CHECKIN_REQUEST_ACCEPTED", "CHECKIN_REQUEST", cr.getId(), "COUNTER_PROPOSED", "ACCEPTED", null, null);
+         return cr;
+     }
+ 
++    /** Tra cứu lịch hẹn của booking: chỉ khách của booking hoặc HOST sở hữu cơ sở (không lộ booking khác -> 404). */
+     @Transactional(readOnly = true)
+-    public List<CheckinRequest> forBooking(Long bookingId) {
++    public List<CheckinRequest> forBooking(AuthUser u, Long bookingId) {
++        Booking b = bookings.findById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
++        boolean customer = b.getCustomerId().equals(u.getId());
++        boolean host = properties.findByIdAndOwnerId(b.getPropertyId(), u.getId()).isPresent();
++        if (!customer && !host) throw BusinessException.notFound("Booking");
+         return requests.findByBookingIdOrderByIdDesc(bookingId);
+     }
+ }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/ConfigService.java b/app-dat-phong/src/main/java/datphong/vn/service/ConfigService.java
+index 19bd594..7096f5f 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/ConfigService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/ConfigService.java
+@@ -47,7 +47,13 @@ public class ConfigService {
+         Instant now = clock.instant();
+         defs.findAll().forEach(d -> m.put(d.getKey(), d.getDefaultValue()));
+         values.findAll().forEach(v -> {
+-            if (v.getScope().equals("GLOBAL") && !v.getEffectiveAt().isAfter(now)) m.put(v.getKey(), v.getValue());
++            if (!v.getScope().equals("GLOBAL")) return;
++            if (!v.getEffectiveAt().isAfter(now)) {
++                m.put(v.getKey(), v.getValue());
++            } else if (v.getPreviousValue() != null) {
++                // giá trị mới lên lịch cho tương lai: tới lúc đó vẫn dùng giá trị đang hiệu lực trước đây (không rơi về default)
++                m.put(v.getKey(), v.getPreviousValue());
++            }
+         });
+         this.cache = m;
+         this.loadedAtMs = System.currentTimeMillis();
+@@ -106,6 +112,7 @@ public class ConfigService {
+ 
+         Map<String, String> merged = new HashMap<>(snapshot());
+         for (var e : changes.entrySet()) {
++            if (e.getValue() == null) throw BusinessException.validation("Giá trị không được rỗng: " + e.getKey());
+             ConfigDefinition d = defs.findByKey(e.getKey())
+                     .orElseThrow(() -> BusinessException.validation("Khóa cấu hình không tồn tại: " + e.getKey()));
+             validate(d, e.getValue());
+@@ -118,7 +125,13 @@ public class ConfigService {
+ 
+         for (var e : changes.entrySet()) {
+             ConfigValue v = values.findByKeyAndScopeAndScopeId(e.getKey(), "GLOBAL", "").orElse(null);
+-            String old = v == null ? defs.findByKey(e.getKey()).get().getDefaultValue() : v.getValue();
++            String def = defs.findByKey(e.getKey()).get().getDefaultValue();
++            // giá trị ĐANG hiệu lực tại thời điểm ghi (bản ghi cũ có thể còn đang chờ effective_at ở tương lai)
++            String effectiveNow;
++            if (v == null) effectiveNow = def;
++            else if (!v.getEffectiveAt().isAfter(clock.instant())) effectiveNow = v.getValue();
++            else effectiveNow = v.getPreviousValue() == null ? def : v.getPreviousValue();
++            String old = effectiveNow;
+             if (v == null) {
+                 v = new ConfigValue();
+                 v.setKey(e.getKey());
+@@ -126,6 +139,7 @@ public class ConfigService {
+             } else {
+                 v.setVersion(v.getVersion() + 1);
+             }
++            v.setPreviousValue(effectiveNow);
+             v.setValue(e.getValue());
+             v.setEffectiveAt(eff);
+             v.setUpdatedBy(actorId);
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/ConversationService.java b/app-dat-phong/src/main/java/datphong/vn/service/ConversationService.java
+index a8a58f4..6b8ee8e 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/ConversationService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/ConversationService.java
+@@ -67,14 +67,19 @@ public class ConversationService {
+     }
+ 
+     // ------------------------------------------------------------------ mở hội thoại
+-    public Map<String, Object> open(Long customerId, MessagingRequests.OpenConversation r) {
++    /**
++     * UC-27. CUSTOMER mở hội thoại INQUIRY (theo property PUBLISHED) hoặc BOOKING_SUPPORT (booking của chính mình).
++     * HOST có thể chủ động mở BOOKING_SUPPORT với khách của một booking thuộc cơ sở mình đang sở hữu.
++     * Cặp participant luôn suy ra từ DB (booking.customer, property.owner), không tin userId từ request.
++     */
++    public Map<String, Object> open(AuthUser u, MessagingRequests.OpenConversation r) {
+         ConversationType type;
+         try { type = ConversationType.valueOf(r.type()); } catch (Exception e) { throw BusinessException.validation("type phải là INQUIRY | BOOKING_SUPPORT"); }
+-        rateLimit.check("conv:open:" + customerId, 10, Duration.ofHours(1));
++        rateLimit.check("conv:open:" + u.getId(), 10, Duration.ofHours(1));
+         TransactionTemplate tx = new TransactionTemplate(txm);
+         for (int attempt = 0; attempt < 2; attempt++) {
+             try {
+-                return tx.execute(s -> openTx(customerId, type, r));
++                return tx.execute(s -> openTx(u, type, r));
+             } catch (DataIntegrityViolationException e) {
+                 // hai request khởi tạo song song: unique active key chặn bản thứ hai; lượt sau sẽ tìm thấy hội thoại đã tạo
+                 if (attempt == 1) throw e;
+@@ -83,24 +88,33 @@ public class ConversationService {
+         throw new IllegalStateException();
+     }
+ 
+-    private Map<String, Object> openTx(Long customerId, ConversationType type, MessagingRequests.OpenConversation r) {
++    private Map<String, Object> openTx(AuthUser u, ConversationType type, MessagingRequests.OpenConversation r) {
+         Property p;
+         Long bookingId = r.bookingId();
++        Long customerId;
+         if (bookingId != null) {
+-            Booking b = bookings.findByIdAndCustomerId(bookingId, customerId).orElseThrow(() -> BusinessException.notFound("Booking"));
++            Booking b = bookings.findById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
+             p = properties.findById(b.getPropertyId()).orElseThrow();
++            boolean isCustomer = b.getCustomerId().equals(u.getId());
++            boolean isOwner = p.getOwnerId().equals(u.getId()) && u.hasPermission("BOOKING_UPDATE");
++            if (!isCustomer && !isOwner) throw BusinessException.notFound("Booking");          // không có quan hệ hợp lệ
++            if (r.propertyId() != null && !p.getId().equals(r.propertyId())) throw BusinessException.validation("propertyId không khớp booking");
++            customerId = b.getCustomerId();
+         } else {
+             if (type == ConversationType.BOOKING_SUPPORT) throw BusinessException.validation("BOOKING_SUPPORT cần bookingId");
++            if (!u.hasPermission("BOOKING_CREATE")) throw BusinessException.forbidden("HOST chỉ mở hội thoại gắn với booking của cơ sở mình");
++            if (r.propertyId() == null) throw BusinessException.validation("Cần propertyId");
+             p = properties.findById(r.propertyId()).filter(x -> x.getStatus() == PropertyStatus.PUBLISHED)
+                     .orElseThrow(() -> BusinessException.notFound("Cơ sở"));
++            if (p.getOwnerId().equals(u.getId())) throw BusinessException.validation("Không thể mở hội thoại với chính cơ sở của mình");
++            customerId = u.getId();
+         }
+-        if (bookingId != null && !p.getId().equals(r.propertyId())) throw BusinessException.validation("propertyId không khớp booking");
+-        User me = users.findById(customerId).orElseThrow();
++        User me = users.findById(u.getId()).orElseThrow();
+         if (me.getStatus() != UserStatus.ACTIVE) throw BusinessException.forbidden("Tài khoản không được phép tạo hội thoại");
+ 
+         Conversation c = conversations.findActive(customerId, p.getId(), type, bookingId).orElse(null);
+         if (c == null) {
+-            if (conversations.countOpenByCustomer(customerId) >= config.getInt("conversation.maxOpen")) {
++            if (customerId.equals(u.getId()) && conversations.countOpenByCustomer(customerId) >= config.getInt("conversation.maxOpen")) {
+                 throw new BusinessException(ErrorCode.RATE_LIMITED, "Bạn đang có quá nhiều hội thoại mở");
+             }
+             c = new Conversation();
+@@ -114,7 +128,7 @@ public class ConversationService {
+             participants.save(new ConversationParticipant(c.getId(), p.getOwnerId(), "HOST"));
+         }
+         Conversation locked = conversations.lockById(c.getId()).orElseThrow();
+-        Message m = appendMessage(locked, customerId, MessageType.NORMAL, r.firstMessage(), r.clientMessageId());
++        Message m = appendMessage(locked, u.getId(), MessageType.NORMAL, r.firstMessage(), r.clientMessageId());
+         return Map.of("conversationId", locked.getId(), "type", locked.getType().name(), "status", locked.getStatus(),
+                 "lastSeq", locked.getLastMessageSeq(), "firstMessageSeq", m.getSeq(), "bookingId", String.valueOf(bookingId));
+     }
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/EmailTemplateService.java b/app-dat-phong/src/main/java/datphong/vn/service/EmailTemplateService.java
+index f51c2bd..06c990b 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/EmailTemplateService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/EmailTemplateService.java
+@@ -112,6 +112,18 @@ public class EmailTemplateService {
+         for (String req : def.vars()) if (req.equals("verificationLink") || req.equals("bookingCode") || req.equals("verificationCode")) {
+             if (def.vars().contains(req) && !used.contains(req)) problems.add("thiếu biến bắt buộc: " + req);
+         }
++        // Render thử với dữ liệu mẫu (UC-31 bước 3): phát hiện biến thiếu/lỗi cú pháp trước khi thay bản đang hoạt động
++        if (problems.isEmpty()) {
++            Map<String, Object> sample = new HashMap<>();
++            for (String name : allowed) sample.put(name, "<" + name + ">");
++            try {
++                renderer.render(v.getSubjectTemplate(), v.getHtmlBody(), v.getTextBody(), allowed, sample);
++            } catch (TemplateRenderer.MissingVariableException | IllegalArgumentException e) {
++                problems.add("render thử thất bại: " + e.getMessage());
++            }
++            String unclosed = (v.getSubjectTemplate() + v.getHtmlBody() + v.getTextBody()).replaceAll("\\{\\{\\s*[A-Za-z][A-Za-z0-9_]*\\s*}}", "");
++            if (unclosed.contains("{{") || unclosed.contains("}}")) problems.add("cú pháp biến không hợp lệ (thiếu {{ hoặc }})");
++        }
+         if (!problems.isEmpty()) throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Template chưa đủ điều kiện publish", problems);
+ 
+         versions.findByTemplateIdOrderByVersionDesc(templateId).stream().filter(x -> x.getStatus().equals("ACTIVE")).forEach(x -> x.setStatus("ARCHIVED"));
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/MailService.java b/app-dat-phong/src/main/java/datphong/vn/service/MailService.java
+index 34d4ef2..06e5684 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/MailService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/MailService.java
+@@ -22,7 +22,7 @@ import java.util.Optional;
+ 
+ /**
+  * UC-32: tạo email LOGICAL từ business event. Mail là side effect bất đồng bộ - không bao giờ gọi SMTP trong transaction nghiệp vụ.
+- * dedupe_key = eventType + businessId + recipient + templateVersion -> callback/sự kiện lặp chỉ tạo một email logical.
++ * dedupe_key = eventType + businessId + recipient -> callback/sự kiện lặp chỉ tạo một email logical.
+  * Version template được GHIM vào mail_event + snapshot biến: retry sau khi admin publish bản mới vẫn gửi đúng nội dung cũ.
+  */
+ @Slf4j
+@@ -40,7 +40,9 @@ public class MailService {
+     @Transactional(propagation = Propagation.REQUIRED)
+     public MailEvent enqueue(MailEventType type, String businessId, Long bookingId, String recipient, Map<String, Object> vars, Instant dueAt) {
+         Optional<EmailTemplateVersion> v = activeVersion(type.name());
+-        String dedupe = type + "|" + businessId + "|" + recipient.toLowerCase() + "|" + v.map(x -> String.valueOf(x.getId())).orElse("none");
++        // Dedupe theo sự kiện/khóa nghiệp vụ + người nhận (KHÔNG gồm template version): admin publish mẫu mới
++        // không được làm một sự kiện đã xếp hàng sinh thêm email thứ hai.
++        String dedupe = type + "|" + businessId + "|" + recipient.toLowerCase();
+         if (mails.existsByDedupeKey(dedupe)) return null;
+         MailEvent m = new MailEvent();
+         m.setDedupeKey(dedupe);
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/MailWorker.java b/app-dat-phong/src/main/java/datphong/vn/service/MailWorker.java
+index e154981..b71d910 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/MailWorker.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/MailWorker.java
+@@ -108,7 +108,7 @@ public class MailWorker {
+ 
+     private void deliver(Long id) {
+         MailEvent m = mails.findById(id).orElseThrow();
+-        EmailTemplateVersion v = versions.findById(m.getTemplateVersionId()).orElse(null);
++        EmailTemplateVersion v = m.getTemplateVersionId() == null ? null : versions.findById(m.getTemplateVersionId()).orElse(null);
+         if (v == null) { finish(id, MailStatus.FAILED_VALIDATION, "NO_TEMPLATE", null); return; }
+ 
+         TemplateRenderer.Rendered r;
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/OutboxProcessor.java b/app-dat-phong/src/main/java/datphong/vn/service/OutboxProcessor.java
+index 22f5d2f..4de4f54 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/OutboxProcessor.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/OutboxProcessor.java
+@@ -59,13 +59,13 @@ public class OutboxProcessor {
+     public int runOnce(int max) {
+         int n = 0;
+         for (int i = 0; i < max; i++) {
+-            Long failedId = null;
+-            String err = null;
++            final Long[] current = new Long[1];
+             try {
+                 Boolean got = tx.execute(s -> {
+                     var o = outbox.claimNext(clock.instant());
+                     if (o.isEmpty()) return false;
+                     OutboxEvent e = o.get();
++                    current[0] = e.getId();
+                     handle(e);
+                     e.setStatus(OutboxStatus.DONE);
+                     e.setProcessedAt(clock.instant());
+@@ -74,20 +74,20 @@ public class OutboxProcessor {
+                 if (!Boolean.TRUE.equals(got)) break;
+                 n++;
+             } catch (Exception ex) {
+-                // transaction đã rollback (kể cả notification đã tạo dở): ghi nhận lỗi + backoff trong transaction riêng
++                // transaction đã rollback (kể cả notification đã tạo dở): ghi nhận lỗi + backoff ĐÚNG event vừa lỗi trong transaction riêng
+                 metrics.counter("scheduler_failures_total", "job", "outbox").increment();
+-                log.warn("outbox event failed: {}", ex.getMessage());
+-                err = ex.getClass().getSimpleName() + ": " + ex.getMessage();
+-                markFailure(err);
++                log.warn("outbox event {} failed: {}", current[0], ex.getMessage());
++                if (current[0] != null) markFailure(current[0], ex.getClass().getSimpleName() + ": " + ex.getMessage());
+                 break;
+             }
+         }
+         return n;
+     }
+ 
+-    /** Đánh dấu lỗi cho event đầu hàng đợi vừa thất bại (event đầu có next_attempt_at nhỏ nhất). */
+-    private void markFailure(String err) {
+-        tx.executeWithoutResult(s -> outbox.claimNext(clock.instant()).ifPresent(e -> {
++    /** Đánh dấu lỗi cho đúng event theo id (không "claim lại event đầu hàng đợi" vì có thể là event khác do instance khác đã lấy). */
++    private void markFailure(Long eventId, String err) {
++        tx.executeWithoutResult(s -> outbox.findById(eventId).ifPresent(e -> {
++            if (e.getStatus() == OutboxStatus.DONE) return;
+             e.setRetryCount(e.getRetryCount() + 1);
+             e.setLastError(err == null ? null : err.substring(0, Math.min(500, err.length())));
+             if (e.getRetryCount() >= MAX_RETRY) {
+@@ -191,6 +191,14 @@ public class OutboxProcessor {
+                 Booking b = booking(p);
+                 notify(e, b.getCustomerId(), "Chủ cơ sở đã phản hồi giờ check-in", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
+             }
++            case "CHECKIN_REQUEST_ACCEPTED" -> {
++                Booking b = booking(p);
++                notify(e, property(b).getOwnerId(), "Khách đã đồng ý giờ check-in đề xuất", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
++            }
++            case "BOOKING_NO_SHOW" -> {
++                Booking b = booking(p);
++                notify(e, b.getCustomerId(), "Booking được ghi nhận vắng mặt", "Booking " + b.getBookingCode() + " đã bị đánh dấu không đến nhận phòng", "BOOKING", b.getId());
++            }
+             case "COMPLAINT_CREATED" -> {
+                 Booking b = booking(p);
+                 notify(e, property(b).getOwnerId(), "Phản ánh mới từ khách", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/PaymentService.java b/app-dat-phong/src/main/java/datphong/vn/service/PaymentService.java
+index 135070a..c6e2d5b 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/PaymentService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/PaymentService.java
+@@ -68,6 +68,9 @@ public class PaymentService {
+             var open = payments.findByBookingIdOrderByIdDesc(b.getId()).stream().filter(p -> IN_FLIGHT.contains(p.getStatus())).findFirst();
+             if (open.isPresent()) return new Step1(open.get(), b, false);
+ 
++            if (b.getTotalAmount() == null || b.getTotalAmount().signum() <= 0) {
++                throw new BusinessException(ErrorCode.BUSINESS_RULE_VIOLATION, "Booking không có số tiền cần thanh toán");
++            }
+             Payment p = new Payment();
+             p.setIntentCode(Texts.code("PI", 14));
+             p.setBookingId(b.getId());
+@@ -86,6 +89,15 @@ public class PaymentService {
+ 
+         analytics.record("PAYMENT_INITIATED:" + p.getId(), "PAYMENT_INITIATED", s1.booking().getPropertyId(), "u" + customerId, String.valueOf(s1.booking().getId()), null);
+ 
++        // ---- bước 1b (DB, ngắn): INITIATED -> PROCESSING và COMMIT trước khi gọi bank (UC-10 / §7.2 bước 1).
++        // Nếu tiến trình chết trong lúc gọi bank, job đối soát thấy PROCESSING và hỏi bank bằng CÙNG idempotencyKey.
++        tx.executeWithoutResult(st -> payments.lockById(p.getId()).ifPresent(x -> {
++            if (x.getStatus() == PaymentStatus.INITIATED) {
++                x.setStatus(PaymentStatus.PROCESSING);
++                x.setAttempts(x.getAttempts() + 1);
++            }
++        }));
++
+         // ---- bước 2: gọi Fake Bank NGOÀI transaction
+         try {
+             FakeBankClient.BankTxn t = bank.debit(p.getIntentCode(), s1.booking().getBookingCode(), p.getAmount(), p.getCurrency(), p.getIdempotencyKey(), p.getPayerAccount());
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/ReconciliationService.java b/app-dat-phong/src/main/java/datphong/vn/service/ReconciliationService.java
+index fdd97e6..de50a96 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/ReconciliationService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/ReconciliationService.java
+@@ -37,6 +37,7 @@ import java.util.Map;
+ public class ReconciliationService {
+ 
+     private final PaymentRepository payments;
++    private final datphong.vn.repository.BookingRepository bookings;
+     private final RefundRepository refunds;
+     private final ReconciliationCaseRepository cases;
+     private final FakeBankClient bank;
+@@ -113,7 +114,7 @@ public class ReconciliationService {
+             var res = bank.lookupRefund(r.getRefundKey());
+             if (res.isPresent() && ("SUCCEEDED".equals(res.get().status()) || "FAILED".equals(res.get().status()))) {
+                 refundService.applyResult(r.getRefundKey(), res.get().status(), res.get().providerRef(), res.get().failureCode(),
+-                        "recon-refund:" + r.getRefundKey() + ":" + res.get().status());
++                        "recon-refund:" + r.getRefundKey() + ":" + r.getAttempts() + ":" + res.get().status());
+             } else if (res.isEmpty()) {
+                 // bank chưa nhận refund: đưa về FAILED để retry ĐÚNG refund_key cũ
+                 refundService.applyResult(r.getRefundKey(), "FAILED", null, "NOT_FOUND_AT_BANK", "recon-refund-missing:" + r.getRefundKey() + ":" + r.getAttempts());
+@@ -131,6 +132,47 @@ public class ReconciliationService {
+         audit.attempt("REFUND_RECONCILE", "REFUND", refundId, reason, Map.of(), "SUCCESS");
+     }
+ 
++    /** UC-36: SUPPORT yêu cầu đối soát lại một payment (hỏi bank bằng CHÍNH idempotencyKey, không debit lại). Có lý do + audit. */
++    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED)
++    public Map<String, Object> manualReconcilePayment(Long paymentId, String reason) {
++        Payment before = payments.findById(paymentId).orElseThrow(() -> BusinessException.notFound("Payment"));
++        audit.attempt("PAYMENT_RECONCILE", "PAYMENT", paymentId, reason, Map.of("statusBefore", before.getStatus().name()), "ATTEMPT");
++        boolean applied = reconcileOne(paymentId);
++        Payment after = payments.findById(paymentId).orElseThrow();
++        audit.attempt("PAYMENT_RECONCILE", "PAYMENT", paymentId, reason,
++                Map.of("statusBefore", before.getStatus().name(), "statusAfter", after.getStatus().name()), applied ? "SUCCESS" : "NO_CHANGE");
++        return Map.of("paymentId", paymentId, "status", after.getStatus().name(), "applied", applied);
++    }
++
++    /**
++     * UC-36: tạo refund BÙ TRỪ cho một ca đối soát đang mở (vd. UNKNOWN_PAYMENT đã được xác nhận tiền đã thu nhưng booking không thể xác nhận).
++     * refund_key ổn định theo ca ("comp-case-{id}") nên bấm lặp không hoàn hai lần; số tiền = phần còn lại chưa hoàn (không vượt captured).
++     * Thứ tự khóa: booking -> payment -> refund.
++     */
++    @Transactional
++    public CaseDto compensate(Long caseId, Long actorId, String reason) {
++        ReconciliationCase c = cases.findById(caseId).orElseThrow(() -> BusinessException.notFound("Ca đối soát"));
++        if (!"OPEN".equals(c.getStatus())) throw BusinessException.conflict("Ca đối soát đã đóng");
++        if (c.getPaymentId() == null) throw BusinessException.validation("Ca đối soát không gắn payment");
++        if (c.getBookingId() != null) bookings.lockById(c.getBookingId());                      // 1. booking
++        Payment p = payments.lockById(c.getPaymentId()).orElseThrow();                          // 2. payment
++        var existing = refunds.findByRefundKey("comp-case-" + caseId);
++        if (existing.isPresent()) return dto(c);                                                // idempotent
++        if (p.getStatus() != PaymentStatus.SUCCEEDED) {
++            throw new BusinessException(datphong.vn.exception.ErrorCode.PAYMENT_REQUIRES_REVIEW,
++                    "Payment đang " + p.getStatus() + ": hãy đối soát payment trước khi bù trừ");
++        }
++        java.math.BigDecimal remaining = p.getAmount().subtract(refunds.committedForPayment(p.getId()));
++        if (remaining.signum() <= 0) {
++            throw new BusinessException(datphong.vn.exception.ErrorCode.REFUND_AMOUNT_EXCEEDED, "Payment đã được hoàn/đang hoàn toàn bộ số tiền");
++        }
++        Refund r = refundService.request(p, remaining, "comp-case-" + caseId, "COMPENSATION:" + c.getType(), actorId);
++        c.setRefundId(r.getId());
++        audit.record("CASE_COMPENSATE", "RECON_CASE", caseId, "OPEN", "REFUND_REQUESTED", reason,
++                Map.of("refundId", r.getId(), "amount", remaining));
++        return dto(c);
++    }
++
+     @Transactional(readOnly = true)
+     public Page<CaseDto> openCases(int page, int size) {
+         return cases.findByStatusOrderByIdDesc("OPEN", PageRequest.of(Math.max(0, page), Math.min(Math.max(1, size), 100))).map(this::dto);
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/RefundService.java b/app-dat-phong/src/main/java/datphong/vn/service/RefundService.java
+index 003fa43..0afe36f 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/RefundService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/RefundService.java
+@@ -79,7 +79,7 @@ public class RefundService {
+     /** @return true nếu đã gọi bank. */
+     public boolean process(Long refundId) {
+         TransactionTemplate tx = new TransactionTemplate(txManager);
+-        record Ctx(String key, String providerTxnId, BigDecimal amount, String currency, String reason) {}
++        record Ctx(String key, String providerTxnId, BigDecimal amount, String currency, String reason, int attempt) {}
+ 
+         // Bước 1 (commit trước khi gọi bank): REQUESTED/FAILED -> PROCESSING
+         Ctx ctx = tx.execute(s -> {
+@@ -91,7 +91,7 @@ public class RefundService {
+             if (p.getProviderTxnId() == null) return null; // chưa có giao dịch bank để hoàn
+             r.setStatus(RefundStatus.PROCESSING);
+             r.setAttempts(r.getAttempts() + 1);
+-            return new Ctx(r.getRefundKey(), p.getProviderTxnId(), r.getAmount(), p.getCurrency(), r.getReason());
++            return new Ctx(r.getRefundKey(), p.getProviderTxnId(), r.getAmount(), p.getCurrency(), r.getReason(), r.getAttempts());
+         });
+         if (ctx == null) return false;
+ 
+@@ -99,7 +99,8 @@ public class RefundService {
+         try {
+             FakeBankClient.BankRefund res = bank.refund(ctx.key(), ctx.providerTxnId(), ctx.amount(), ctx.currency(), ctx.reason());
+             if ("SUCCEEDED".equals(res.status()) || "FAILED".equals(res.status())) {
+-                applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(), "sync-refund:" + ctx.key() + ":" + res.status());
++                // eventId gắn số lần thử: kết quả FAILED của lần retry sau KHÔNG bị coi là bản lặp của lần trước (nếu không refund kẹt PROCESSING mãi)
++                applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(), "sync-refund:" + ctx.key() + ":" + ctx.attempt() + ":" + res.status());
+             }
+             // PROCESSING/ACCEPTED: chờ webhook hoặc đối soát
+         } catch (FakeBankClient.BankUnknownException e) {
+@@ -130,7 +131,9 @@ public class RefundService {
+         if (r.getStatus() == RefundStatus.SUCCEEDED) return; // idempotent
+ 
+         if ("SUCCEEDED".equals(status)) {
+-            if (r.getStatus() == RefundStatus.REQUESTED) r.setStatus(RefundStatus.PROCESSING); // webhook đến trước bước PROCESSING
++            // webhook đến trước bước PROCESSING, hoặc bank xác nhận thành công cho một lần thử đã bị coi là FAILED (timeout/đối soát sớm):
++            // tiền đã hoàn thật ở bank là nguồn sự thật -> đi qua PROCESSING rồi SUCCEEDED (không hoàn thêm lần nào nữa).
++            if (r.getStatus() == RefundStatus.REQUESTED || r.getStatus() == RefundStatus.FAILED) r.setStatus(RefundStatus.PROCESSING);
+             if (!Transitions.canTransition(r.getStatus(), RefundStatus.SUCCEEDED)) return;
+             r.setStatus(RefundStatus.SUCCEEDED);
+             r.setProviderRef(providerRef);
+diff --git a/app-dat-phong/src/main/java/datphong/vn/service/StayService.java b/app-dat-phong/src/main/java/datphong/vn/service/StayService.java
+index f573c4b..5e9db40 100644
+--- a/app-dat-phong/src/main/java/datphong/vn/service/StayService.java
++++ b/app-dat-phong/src/main/java/datphong/vn/service/StayService.java
+@@ -117,6 +117,33 @@ public class StayService {
+         transitions.release(bookingId);
+         reminders.cancelForBooking(bookingId);
+         checkinRequests.closeOpenForBooking(bookingId);
++        outbox.publish("BOOKING_NO_SHOW:" + bookingId, "BOOKING_NO_SHOW", "BOOKING", bookingId, Map.of("bookingId", bookingId));
+         audit.record("BOOKING_NO_SHOW", "BOOKING", bookingId, "CONFIRMED", "NO_SHOW", reason, null);
+     }
++
++    /**
++     * UC-15 luồng ngoại lệ: check-out khi booking CHƯA check-in (khách đã ở nhưng lễ tân quên check-in, sự cố hệ thống...).
++     * Chỉ SUPPORT có quyền SUPPORT_STAY_EXCEPTION, bắt buộc lý do, có audit. Đi qua state machine bình thường
++     * (CONFIRMED -> CHECKED_IN -> COMPLETED) với actor SUPPORT; actual_check_in giữ null để phân biệt với check-in thật.
++     * Không thay đổi tổng tiền đã xác nhận. Request lặp không cập nhật hai lần.
++     */
++    @Transactional
++    public void supportForceCheckout(Long supportId, Long bookingId, String reason) {
++        if (reason == null || reason.isBlank()) throw BusinessException.validation("Cần nêu lý do xử lý ngoại lệ");
++        Booking b = bookings.lockById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
++        if (b.getStatus() == BookingStatus.COMPLETED) return;
++        if (b.getStatus() != BookingStatus.CONFIRMED && b.getStatus() != BookingStatus.CHECKED_IN) {
++            throw new BusinessException(ErrorCode.CHECKIN_NOT_ALLOWED, "Booking " + b.getStatus() + " không thể check-out ngoại lệ");
++        }
++        String from = b.getStatus().name();
++        if (b.getStatus() == BookingStatus.CONFIRMED) {
++            transitions.to(b, BookingStatus.CHECKED_IN, "SUPPORT", supportId, "Ngoại lệ (không có check-in thực tế): " + reason);
++        }
++        transitions.to(b, BookingStatus.COMPLETED, "SUPPORT", supportId, "Check-out ngoại lệ: " + reason);
++        b.setActualCheckOut(clock.instant());
++        reminders.cancelForBooking(bookingId);
++        checkinRequests.closeOpenForBooking(bookingId);
++        outbox.publish("BOOKING_COMPLETED:" + bookingId, "BOOKING_COMPLETED", "BOOKING", bookingId, Map.of("bookingId", bookingId));
++        audit.record("SUPPORT_FORCE_CHECKOUT", "BOOKING", bookingId, from, "COMPLETED", reason, null);
++    }
+ }
+diff --git a/app-dat-phong/src/main/resources/db/migration/V3__usecase_fixes.sql b/app-dat-phong/src/main/resources/db/migration/V3__usecase_fixes.sql
+new file mode 100644
+index 0000000..39a390d
+--- /dev/null
++++ b/app-dat-phong/src/main/resources/db/migration/V3__usecase_fixes.sql
+@@ -0,0 +1,15 @@
++-- V3: bổ sung theo đối chiếu đặc tả use case (UC-15, UC-30). Không sửa V1/V2 đã chạy.
++
++-- UC-30: giá trị cấu hình lên lịch ở tương lai không được làm hệ thống rơi về default trước thời điểm hiệu lực.
++-- previous_value = giá trị đang hiệu lực ngay trước lần cập nhật (dùng cho tới effective_at).
++ALTER TABLE config_values ADD COLUMN previous_value VARCHAR(500);
++
++-- UC-15: check-out ngoại lệ (booking chưa check-in) chỉ SUPPORT có quyền riêng, bắt buộc lý do + audit.
++INSERT INTO permissions (code, description) VALUES
++ ('SUPPORT_STAY_EXCEPTION', 'Xử lý ngoại lệ lưu trú (check-out khi chưa check-in) có lý do + audit');
++
++INSERT INTO role_permissions (role_id, permission_id)
++SELECT r.id, p.id FROM roles r JOIN permissions p ON p.code = 'SUPPORT_STAY_EXCEPTION' WHERE r.code = 'SUPPORT';
++
++-- UC-36: SUPPORT xem ca đối soát theo payment nhanh hơn
++CREATE INDEX IF NOT EXISTS idx_case_status ON reconciliation_cases (status, created_at);
+diff --git a/fake-bank/Dockerfile b/fake-bank/Dockerfile
+index ccc33ce..9bc5d54 100644
+--- a/fake-bank/Dockerfile
++++ b/fake-bank/Dockerfile
+@@ -7,6 +7,8 @@ RUN mvn -B package -DskipTests
+ 
+ FROM eclipse-temurin:21-jre-jammy
+ WORKDIR /app
++# healthcheck trong docker-compose dùng curl: cài tường minh, không phụ thuộc base image có sẵn hay không
++RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+ RUN useradd -r -u 1001 bank && chown bank /app
+ USER bank
+ COPY --from=build /build/target/*.jar app.jar
+diff --git a/fake-bank/src/main/java/fakebank/vn/BankController.java b/fake-bank/src/main/java/fakebank/vn/BankController.java
+index e956e12..e05de18 100644
+--- a/fake-bank/src/main/java/fakebank/vn/BankController.java
++++ b/fake-bank/src/main/java/fakebank/vn/BankController.java
+@@ -70,7 +70,8 @@ public class BankController {
+ 
+     // ---- admin (kịch bản lỗi, số dư giả lập) - X-Admin-Token
+     private void admin(String token) {
+-        if (token == null || !java.security.MessageDigest.isEqual(token.getBytes(), adminToken.getBytes())) throw new BankException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "admin token");
++        if (token == null || adminToken == null || adminToken.isBlank()
++                || !java.security.MessageDigest.isEqual(token.getBytes(java.nio.charset.StandardCharsets.UTF_8), adminToken.getBytes(java.nio.charset.StandardCharsets.UTF_8))) throw new BankException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "admin token");
+     }
+ 
+     @GetMapping("/admin/accounts")
+@@ -86,6 +87,16 @@ public class BankController {
+         return Map.of("account", no, "scenario", value);
+     }
+ 
++    public record NewAccount(String accountNo, String ownerName, BigDecimal balance, String scenario) {}
++
++    /** UC-35: quản trị tạo tài khoản giả lập TEST-* với số dư/kịch bản. */
++    @PostMapping("/admin/accounts")
++    public ResponseEntity<Map<String, Object>> createAccount(@RequestBody NewAccount a, @RequestHeader("X-Admin-Token") String token) {
++        admin(token);
++        if (a == null || a.accountNo() == null) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Thiếu accountNo");
++        return ResponseEntity.status(HttpStatus.CREATED).body(bank.createAccount(a.accountNo(), a.ownerName(), a.balance(), a.scenario()));
++    }
++
+     @PostMapping("/admin/accounts/{no}/topup")
+     public Map<String, String> topUp(@PathVariable String no, @RequestParam BigDecimal amount, @RequestHeader("X-Admin-Token") String token) {
+         admin(token);
+@@ -101,11 +112,12 @@ public class BankController {
+ 
+     @ExceptionHandler(BankException.class)
+     public ResponseEntity<Map<String, Object>> handle(BankException e) {
+-        return ResponseEntity.status(e.status).body(Map.of("code", e.code, "message", e.getMessage()));
++        return ResponseEntity.status(e.status).body(Map.of("code", e.code, "message", String.valueOf(e.getMessage())));
+     }
+ 
+     @ExceptionHandler(Exception.class)
+     public ResponseEntity<Map<String, Object>> unexpected(Exception e) {
++        org.slf4j.LoggerFactory.getLogger(BankController.class).error("bank internal error: {}", e.toString());
+         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("code", "BANK_INTERNAL_ERROR", "message", "Lỗi nội bộ phía bank"));
+     }
+ }
+diff --git a/fake-bank/src/main/java/fakebank/vn/BankService.java b/fake-bank/src/main/java/fakebank/vn/BankService.java
+index 1257d75..58986c3 100644
+--- a/fake-bank/src/main/java/fakebank/vn/BankService.java
++++ b/fake-bank/src/main/java/fakebank/vn/BankService.java
+@@ -51,6 +51,7 @@ public class BankService {
+         String currency = str(req, "currency");
+         String payer = str(req, "payerAccount");
+         if (amount.signum() <= 0) throw new BankException(HttpStatus.BAD_REQUEST, "INVALID_AMOUNT", "Số tiền phải > 0");
++        requireSimulatedAccount(payer);
+         String hash = Crypto.sha256(merchant + "|" + str(req, "paymentIntentId") + "|" + amount.stripTrailingZeros().toPlainString() + "|" + currency + "|" + payer);
+ 
+         // Cùng key + cùng payload -> trả giao dịch cũ; cùng key + khác payload -> IDEMPOTENCY_CONFLICT.
+@@ -66,7 +67,6 @@ public class BankService {
+         Map<String, Object> result;
+         try {
+             result = tx.execute(s -> {
+-                if ("DB_OUTAGE".equals(scenario)) throw new IllegalStateException("Mô phỏng lỗi DB phía bank (rollback toàn bộ)");
+                 // INITIATED (unique chặn hai request cùng key đồng thời)
+                 jdbc.update("INSERT INTO bank_transactions (merchant_id, merchant_reference, payment_intent_id, idempotency_key, request_hash, payer_account_no, amount, currency, status, provider_txn_id, created_at, updated_at) "
+                                 + "VALUES (:m, :ref, :pi, :k, :h, :p, :a, :c, 'INITIATED', :tid, :now, :now)",
+@@ -104,11 +104,19 @@ public class BankService {
+                 jdbc.update("UPDATE bank_transactions SET status = :s, failure_code = :f, updated_at = :now WHERE id = :id",
+                         new MapSqlParameterSource("s", status).addValue("f", failure).addValue("now", Timestamp.from(now)).addValue("id", txnId));
+                 enqueuePaymentWebhooks(scenario, merchant, key, providerTxnId, status, failure, amount, currency, now);
++                if ("DB_OUTAGE".equals(scenario)) {
++                    // Mô phỏng DB bank lỗi SAU khi đã ghi số dư/sổ cái/outbox: transaction rollback TOÀN BỘ -> ledger không lệch,
++                    // không có giao dịch để tra cứu, không có webhook. Client nhận 503 (không biết kết quả) -> payment UNKNOWN -> đối soát.
++                    throw new BankException(HttpStatus.SERVICE_UNAVAILABLE, "BANK_DB_UNAVAILABLE", "Mô phỏng lỗi DB phía bank (đã rollback toàn bộ)");
++                }
+                 Map<String, Object> out = new LinkedHashMap<>();
+                 out.put("providerTxnId", providerTxnId);
+-                out.put("status", status);
++                // Kịch bản callback bất đồng bộ: bank chỉ báo ACCEPTED, kết quả cuối đến qua webhook (lặp/chậm/mất) hoặc tra cứu đối soát.
++                boolean async = "SUCCEEDED".equals(status) && ("CALLBACK_LOST".equals(scenario) || "DELAYED_CALLBACK".equals(scenario)
++                        || "DUPLICATE_CALLBACK".equals(scenario));
++                out.put("status", async ? "ACCEPTED" : status);
+                 out.put("failureCode", failure);
+-                out.put("amount", amount);
++                out.put("amount", amount.toPlainString());
+                 out.put("currency", currency);
+                 return out;
+             });
+@@ -134,7 +142,7 @@ public class BankService {
+         p.put("providerTxnId", txnId);
+         p.put("status", status);
+         p.put("failureCode", failure);
+-        p.put("amount", amount);
++        p.put("amount", amount.toPlainString());
+         p.put("currency", currency);
+         p.put("occurredAt", now.toString());
+         Instant at = "DELAYED_CALLBACK".equals(scenario) ? now.plusSeconds(delayedCallbackSeconds) : now;
+@@ -161,7 +169,7 @@ public class BankService {
+         out.put("providerTxnId", t.get("provider_txn_id"));
+         out.put("status", t.get("status"));
+         out.put("failureCode", t.get("failure_code"));
+-        out.put("amount", t.get("amount"));
++        out.put("amount", t.get("amount") == null ? null : ((BigDecimal) t.get("amount")).toPlainString());
+         out.put("currency", t.get("currency"));
+         return out;
+     }
+@@ -178,7 +186,9 @@ public class BankService {
+         Optional<Map<String, Object>> existing = findRefund(merchant, refundKey);
+         if (existing.isPresent()) {
+             if (!hash.equals(existing.get().get("request_hash"))) throw new BankException(HttpStatus.CONFLICT, "IDEMPOTENCY_CONFLICT", "Cùng refundKey nhưng khác nội dung");
+-            return refundView(existing.get());
++            // SUCCEEDED (hoặc đang xử lý): idempotent, không hoàn lần hai. FAILED: cho phép thử lại CÙNG refundKey (retry hữu hạn phía merchant).
++            if (!"FAILED".equals(existing.get().get("status"))) return refundView(existing.get());
++            return retryFailedRefund(merchant, refundKey, amount);
+         }
+         try {
+             return tx.execute(s -> {
+@@ -217,7 +227,7 @@ public class BankService {
+                         new MapSqlParameterSource().addValue("m", merchant).addValue("k", refundKey).addValue("h", hash).addValue("t", txnId)
+                                 .addValue("a", amount).addValue("s", status).addValue("f", failure).addValue("r", providerRef).addValue("now", Timestamp.from(now)));
+                 Map<String, Object> p = new LinkedHashMap<>();
+-                p.put("eventId", "evt-" + providerRef + "-" + status);
++                p.put("eventId", "evt-" + providerRef + "-" + status + "-1");
+                 p.put("type", "REFUND_RESULT");
+                 p.put("refundKey", refundKey);
+                 p.put("providerRef", providerRef);
+@@ -235,6 +245,64 @@ public class BankService {
+         }
+     }
+ 
++    /** Thử lại một refund FAILED với cùng refundKey: khóa bản ghi, kiểm tra lại kịch bản/số dư, cập nhật trạng thái tại chỗ. */
++    private Map<String, Object> retryFailedRefund(String merchant, String refundKey, BigDecimal amount) {
++        return tx.execute(s -> {
++            Map<String, Object> r = jdbc.queryForList("SELECT * FROM bank_refunds WHERE merchant_id = :m AND refund_key = :k FOR UPDATE",
++                    new MapSqlParameterSource("m", merchant).addValue("k", refundKey)).stream().findFirst().orElseThrow();
++            if (!"FAILED".equals(r.get("status"))) return refundView(r);                  // request song song đã xử lý xong
++            Long txnId = ((Number) r.get("txn_id")).longValue();
++            Map<String, Object> t = jdbc.queryForMap("SELECT * FROM bank_transactions WHERE id = :id FOR UPDATE", new MapSqlParameterSource("id", txnId));
++            BigDecimal already = jdbc.queryForObject("SELECT COALESCE(SUM(amount),0) FROM bank_refunds WHERE txn_id = :id AND status = 'SUCCEEDED'",
++                    new MapSqlParameterSource("id", txnId), BigDecimal.class);
++            String providerRef = (String) r.get("provider_ref");
++            Instant now = Instant.now();
++            String status = "SUCCEEDED";
++            String failure = null;
++            Map<String, Object> payer = jdbc.queryForMap("SELECT * FROM bank_accounts WHERE account_no = :n", new MapSqlParameterSource("n", t.get("payer_account_no")));
++            if (already.add(amount).compareTo((BigDecimal) t.get("amount")) > 0) { status = "FAILED"; failure = "REFUND_EXCEEDED"; }
++            else if ("REFUND_FAIL".equals(payer.get("scenario"))) { status = "FAILED"; failure = "REFUND_REJECTED"; }
++            else {
++                Long merchantAcc = jdbc.queryForObject("SELECT id FROM bank_accounts WHERE merchant = TRUE ORDER BY id LIMIT 1", new MapSqlParameterSource(), Long.class);
++                Long payerId = ((Number) payer.get("id")).longValue();
++                List<Long> ids = new ArrayList<>(List.of(payerId, merchantAcc));
++                Collections.sort(ids);
++                Map<Long, BigDecimal> bal = new HashMap<>();
++                for (Long id : ids) bal.put(id, jdbc.queryForObject("SELECT balance FROM bank_accounts WHERE id = :id FOR UPDATE", new MapSqlParameterSource("id", id), BigDecimal.class));
++                if (bal.get(merchantAcc).compareTo(amount) < 0) { status = "FAILED"; failure = "MERCHANT_INSUFFICIENT"; }
++                else {
++                    jdbc.update("UPDATE bank_accounts SET balance = balance - :a, version = version + 1 WHERE id = :id", new MapSqlParameterSource("a", amount).addValue("id", merchantAcc));
++                    jdbc.update("UPDATE bank_accounts SET balance = balance + :a, version = version + 1 WHERE id = :id", new MapSqlParameterSource("a", amount).addValue("id", payerId));
++                    ledger(txnId, "REFUND", providerRef, merchantAcc, amount, BigDecimal.ZERO, now);
++                    ledger(txnId, "REFUND", providerRef, payerId, BigDecimal.ZERO, amount, now);
++                }
++            }
++            jdbc.update("UPDATE bank_refunds SET status = :s, failure_code = :f WHERE id = :id",
++                    new MapSqlParameterSource("s", status).addValue("f", failure).addValue("id", r.get("id")));
++            Map<String, Object> p = new LinkedHashMap<>();
++            // eventId mới cho mỗi lần thử (cùng providerRef) để merchant không coi kết quả lần sau là bản lặp của lần trước
++            p.put("eventId", "evt-" + providerRef + "-" + status + "-" + UUID.randomUUID().toString().substring(0, 8));
++            p.put("type", "REFUND_RESULT");
++            p.put("refundKey", refundKey);
++            p.put("providerRef", providerRef);
++            p.put("status", status);
++            p.put("failureCode", failure);
++            outbox((String) p.get("eventId"), "REFUND_RESULT", p, now);
++            Map<String, Object> out = new LinkedHashMap<>();
++            out.put("providerRef", providerRef);
++            out.put("status", status);
++            out.put("failureCode", failure);
++            return out;
++        });
++    }
++
++    /** Chỉ chấp nhận tài khoản giả lập (TEST-xxx hoặc MERCHANT-xxx); chặn mọi chuỗi trông giống số thẻ/tài khoản ngân hàng thật. */
++    private static void requireSimulatedAccount(String accountNo) {
++        if (!accountNo.matches("^(TEST|MERCHANT)-[A-Z0-9-]{1,34}$") || accountNo.replaceAll("\\D", "").length() >= 9) {
++            throw new BankException(HttpStatus.BAD_REQUEST, "REAL_ACCOUNT_FORBIDDEN", "Fake Bank chỉ nhận tài khoản giả lập dạng TEST-xxx");
++        }
++    }
++
+     public Optional<Map<String, Object>> lookupRefund(String merchant, String key) {
+         return findRefund(merchant, key).map(this::refundView);
+     }
+@@ -280,21 +348,61 @@ public class BankService {
+         return jdbc.queryForList("SELECT account_no, owner_name, balance, currency, scenario, merchant FROM bank_accounts ORDER BY id", new MapSqlParameterSource());
+     }
+ 
++    private static final Set<String> SCENARIOS = Set.of("SUCCESS", "DECLINED", "TIMEOUT_AFTER_DEBIT", "CALLBACK_LOST", "DUPLICATE_CALLBACK",
++            "DELAYED_CALLBACK", "DB_OUTAGE", "REFUND_FAIL");
++
+     public void setScenario(String accountNo, String scenario) {
+-        Set<String> ok = Set.of("SUCCESS", "DECLINED", "TIMEOUT_AFTER_DEBIT", "CALLBACK_LOST", "DUPLICATE_CALLBACK", "DELAYED_CALLBACK", "DB_OUTAGE", "REFUND_FAIL");
+-        if (!ok.contains(scenario)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + ok);
+-        jdbc.update("UPDATE bank_accounts SET scenario = :s WHERE account_no = :n", new MapSqlParameterSource("s", scenario).addValue("n", accountNo));
++        if (!SCENARIOS.contains(scenario)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + SCENARIOS);
++        int n = jdbc.update("UPDATE bank_accounts SET scenario = :s WHERE account_no = :n", new MapSqlParameterSource("s", scenario).addValue("n", accountNo));
++        if (n == 0) throw new BankException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "Không có tài khoản " + accountNo);
+     }
+ 
+     public void topUp(String accountNo, BigDecimal amount) {
+         if (amount.signum() <= 0) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "amount > 0");
+-        jdbc.update("UPDATE bank_accounts SET balance = balance + :a WHERE account_no = :n AND merchant = FALSE", new MapSqlParameterSource("a", amount).addValue("n", accountNo));
++        int n = jdbc.update("UPDATE bank_accounts SET balance = balance + :a WHERE account_no = :n AND merchant = FALSE", new MapSqlParameterSource("a", amount).addValue("n", accountNo));
++        if (n == 0) throw new BankException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "Không có tài khoản khách " + accountNo);
++    }
++
++    /** UC-35: tạo tài khoản giả lập (chỉ TEST-*), số dư và kịch bản ban đầu. */
++    public Map<String, Object> createAccount(String accountNo, String ownerName, BigDecimal balance, String scenario) {
++        requireSimulatedAccount(accountNo);
++        if (!accountNo.startsWith("TEST-")) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Tài khoản khách phải bắt đầu bằng TEST-");
++        if (balance == null || balance.signum() < 0) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "balance >= 0");
++        String sc = scenario == null || scenario.isBlank() ? "SUCCESS" : scenario;
++        if (!SCENARIOS.contains(sc)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + SCENARIOS);
++        try {
++            jdbc.update("INSERT INTO bank_accounts (account_no, owner_name, balance, scenario, merchant) VALUES (:n, :o, :b, :s, FALSE)",
++                    new MapSqlParameterSource("n", accountNo).addValue("o", ownerName == null ? accountNo : ownerName).addValue("b", balance).addValue("s", sc));
++        } catch (DuplicateKeyException e) {
++            throw new BankException(HttpStatus.CONFLICT, "ACCOUNT_EXISTS", "Tài khoản đã tồn tại");
++        }
++        return Map.of("account", accountNo, "balance", balance.toPlainString(), "scenario", sc);
+     }
+ 
+-    /** Kiểm tra bất biến sổ cái: tổng nợ == tổng có. */
++    /**
++     * Kiểm tra bất biến sổ cái: tổng nợ == tổng có (toàn cục và theo từng giao dịch), không tài khoản nào âm,
++     * giao dịch SUCCEEDED nào cũng có bút toán, refund không vượt số tiền giao dịch.
++     */
+     public Map<String, Object> ledgerCheck() {
+         Map<String, Object> m = jdbc.queryForMap("SELECT COALESCE(SUM(debit),0) AS debit, COALESCE(SUM(credit),0) AS credit FROM bank_ledger_entries", new MapSqlParameterSource());
+         BigDecimal d = (BigDecimal) m.get("debit"), c = (BigDecimal) m.get("credit");
+-        return Map.of("totalDebit", d, "totalCredit", c, "balanced", d.compareTo(c) == 0);
++        List<Map<String, Object>> unbalanced = jdbc.queryForList("SELECT txn_id, ref_kind, ref_id, SUM(debit) AS debit, SUM(credit) AS credit FROM bank_ledger_entries "
++                + "GROUP BY txn_id, ref_kind, ref_id HAVING SUM(debit) <> SUM(credit) ORDER BY txn_id LIMIT 100", new MapSqlParameterSource());
++        Long negative = jdbc.queryForObject("SELECT COUNT(*) FROM bank_accounts WHERE balance < 0", new MapSqlParameterSource(), Long.class);
++        List<Map<String, Object>> missingEntries = jdbc.queryForList("SELECT t.provider_txn_id FROM bank_transactions t WHERE t.status = 'SUCCEEDED' "
++                + "AND NOT EXISTS (SELECT 1 FROM bank_ledger_entries l WHERE l.txn_id = t.id AND l.ref_kind = 'PAYMENT') LIMIT 100", new MapSqlParameterSource());
++        List<Map<String, Object>> overRefunded = jdbc.queryForList("SELECT t.provider_txn_id, t.amount, SUM(r.amount) AS refunded FROM bank_transactions t "
++                + "JOIN bank_refunds r ON r.txn_id = t.id AND r.status = 'SUCCEEDED' GROUP BY t.id, t.provider_txn_id, t.amount HAVING SUM(r.amount) > t.amount LIMIT 100",
++                new MapSqlParameterSource());
++        boolean ok = d.compareTo(c) == 0 && unbalanced.isEmpty() && (negative == null || negative == 0) && missingEntries.isEmpty() && overRefunded.isEmpty();
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("totalDebit", d);
++        out.put("totalCredit", c);
++        out.put("balanced", ok);
++        out.put("unbalancedEntries", unbalanced);
++        out.put("negativeAccounts", negative);
++        out.put("succeededWithoutLedger", missingEntries);
++        out.put("overRefunded", overRefunded);
++        return out;
+     }
+ }
+diff --git a/ops/prometheus.yml b/ops/prometheus.yml
+index 4d840ee..fdb6aef 100644
+--- a/ops/prometheus.yml
++++ b/ops/prometheus.yml
+@@ -3,8 +3,9 @@ global:
+ scrape_configs:
+   - job_name: app-dat-phong
+     metrics_path: /api/v1/actuator/prometheus
++    # Prometheus KHÔNG thay biến môi trường trong file cấu hình: token được entrypoint (docker-compose) ghi ra file.
+     http_headers:
+       X-Metrics-Token:
+-        values: ["${METRICS_TOKEN}"]
++        files: ["/tmp/metrics_token"]
+     static_configs:
+       - targets: ["app:8080"]

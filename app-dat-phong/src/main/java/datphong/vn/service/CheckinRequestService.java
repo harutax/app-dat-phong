@@ -9,6 +9,7 @@ import datphong.vn.exception.BusinessException;
 import datphong.vn.exception.ErrorCode;
 import datphong.vn.exception.entity.*;
 import datphong.vn.repository.*;
+import datphong.vn.security.AuthUser;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -83,7 +84,8 @@ public class CheckinRequestService {
         return cr;
     }
 
-    @Transactional
+    /** noRollbackFor: khi booking không còn hiệu lực, việc đóng yêu cầu (CLOSED) phải được lưu dù trả lỗi cho HOST. */
+    @Transactional(noRollbackFor = BusinessException.class)
     public CheckinRequest respond(Long ownerId, Long requestId, MessagingRequests.CheckinRespond r) {
         CheckinRequest cr = requests.findById(requestId).orElseThrow(() -> BusinessException.notFound("Yêu cầu check-in"));
         Booking b = bookings.lockById(cr.getBookingId()).orElseThrow();
@@ -130,11 +132,24 @@ public class CheckinRequestService {
         if (b.getStatus() != BookingStatus.CONFIRMED) throw BusinessException.conflict("Booking không còn hiệu lực");
         cr.setStatus(CheckinRequestStatus.ACCEPTED);
         requests.saveAndFlush(cr);
+        // Thông báo kết quả cho HOST (UC-29 bước 184) + lưu vết trong hội thoại
+        if (cr.getConversationId() != null) {
+            Conversation locked = conversations.lockById(cr.getConversationId()).orElseThrow();
+            chat.appendMessage(locked, customerId, MessageType.CHECKIN_REQUEST,
+                    "Khách đồng ý giờ nhận phòng " + cr.getAgreedCheckinAt(), "cin-accept-" + cr.getId());
+        }
+        outbox.publish("CHECKIN_REQUEST_ACCEPTED:" + cr.getId(), "CHECKIN_REQUEST_ACCEPTED", "CHECKIN_REQUEST", cr.getId(), Map.of("bookingId", b.getId()));
+        audit.record("CHECKIN_REQUEST_ACCEPTED", "CHECKIN_REQUEST", cr.getId(), "COUNTER_PROPOSED", "ACCEPTED", null, null);
         return cr;
     }
 
+    /** Tra cứu lịch hẹn của booking: chỉ khách của booking hoặc HOST sở hữu cơ sở (không lộ booking khác -> 404). */
     @Transactional(readOnly = true)
-    public List<CheckinRequest> forBooking(Long bookingId) {
+    public List<CheckinRequest> forBooking(AuthUser u, Long bookingId) {
+        Booking b = bookings.findById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
+        boolean customer = b.getCustomerId().equals(u.getId());
+        boolean host = properties.findByIdAndOwnerId(b.getPropertyId(), u.getId()).isPresent();
+        if (!customer && !host) throw BusinessException.notFound("Booking");
         return requests.findByBookingIdOrderByIdDesc(bookingId);
     }
 }

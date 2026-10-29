@@ -126,6 +126,10 @@ public class CatalogService {
         if (isBlank(p.getAddress()) || isBlank(p.getCity())) missing.add("address/city");
         if (p.getLatitude() == null || p.getLongitude() == null) missing.add("latitude/longitude");
         if (isBlank(p.getContactPhone()) && isBlank(p.getContactEmail())) missing.add("contact");
+        // UC-04: chính sách nhận/trả phòng và hủy phải đầy đủ, hợp lệ trước khi mở bán (booking sẽ snapshot chính sách này)
+        if (p.getCheckInTime() == null || p.getCheckOutTime() == null) missing.add("checkInOutTime");
+        if (p.getFreeCancelHours() < 0 || p.getPenaltyPercent() < 0 || p.getPenaltyPercent() > 100) missing.add("cancellationPolicy");
+        if (!validZone(p.getTimezone())) missing.add("timezone");
         List<RoomType> types = roomTypes.findByPropertyIdOrderById(id).stream().filter(t -> t.getStatus() == RoomStatus.ACTIVE).toList();
         if (types.isEmpty()) missing.add("roomType");
         if (rooms.countActive(id) == 0) missing.add("room");
@@ -204,14 +208,14 @@ public class CatalogService {
     @Transactional
     public RoomTypeDto updateRoomType(Long ownerId, Long typeId, CatalogRequests.RoomTypeUpsert r) {
         RoomType t = roomTypes.findById(typeId).orElseThrow(() -> BusinessException.forbidden("Loại phòng không thuộc quyền của bạn"));
-        owned(ownerId, t.getPropertyId());
+        Property owner = owned(ownerId, t.getPropertyId());
+        if (owner.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
         if (r.version() != null && r.version() != t.getVersion()) throw new BusinessException(ErrorCode.VERSION_CONFLICT, "Dữ liệu đã thay đổi, hãy tải lại");
         if (r.capacity() < t.getCapacity()) {
-            // Giảm sức chứa: không được làm vi phạm booking tương lai đã nhận khách
-            for (Room room : rooms.findByPropertyIdOrderByRoomCode(t.getPropertyId())) {
-                if (room.getRoomTypeId().equals(typeId) && allocations.existsActiveFuture(room.getId(), LocalDate.now(clock))) {
-                    throw new BusinessException(ErrorCode.ROOM_HAS_FUTURE_BOOKINGS, "Loại phòng còn booking tương lai, không thể giảm sức chứa");
-                }
+            // Giảm sức chứa: không được làm vi phạm booking/hold tương lai có số khách vượt sức chứa mới (ngày tính theo múi giờ cơ sở)
+            if (bookingsOverCapacity(typeId, r.capacity(), today(owner))) {
+                throw new BusinessException(ErrorCode.ROOM_HAS_FUTURE_BOOKINGS,
+                        "Loại phòng còn booking/giữ chỗ tương lai có số khách vượt sức chứa mới, không thể giảm sức chứa");
             }
         }
         applyType(t, r);
@@ -239,6 +243,7 @@ public class CatalogService {
     @Transactional
     public RoomDto createRoom(Long ownerId, CatalogRequests.RoomCreate r) {
         Property p = owned(ownerId, r.propertyId());
+        if (p.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
         RoomType t = roomTypes.findByIdAndPropertyId(r.roomTypeId(), p.getId())
                 .orElseThrow(() -> BusinessException.validation("Loại phòng không thuộc cơ sở"));
         if (rooms.existsByPropertyIdAndRoomCode(p.getId(), r.roomCode())) {
@@ -292,7 +297,9 @@ public class CatalogService {
     public int upsertRates(Long ownerId, CatalogRequests.RateUpsert r) {
         RoomType t = roomTypes.findById(r.roomTypeId()).orElseThrow(() -> BusinessException.forbidden("Loại phòng không thuộc quyền của bạn"));
         Property p = owned(ownerId, t.getPropertyId());
+        if (p.getStatus() == PropertyStatus.ARCHIVED) throw BusinessException.conflict("Cơ sở đã lưu trữ");
         if (!r.to().isAfter(r.from())) throw BusinessException.validation("to phải sau from");
+        if (r.amount().signum() < 0) throw BusinessException.validation("Giá không được âm");
         if (r.from().isBefore(today(p))) throw BusinessException.validation("Không đổi giá cho ngày đã qua");
         if (r.from().plusDays(366).isBefore(r.to())) throw BusinessException.validation("Tối đa 366 đêm mỗi lần");
 
@@ -330,9 +337,24 @@ public class CatalogService {
         return rates.findRange(roomTypeId, from, to).stream().map(x -> new RateDto(x.getStayDate(), x.getAmount(), x.getCurrency())).toList();
     }
 
+    /** Có booking/hold đang chiếm phòng (allocation active, chưa trả phòng) thuộc loại phòng này với số khách > capacity mới không. */
+    private boolean bookingsOverCapacity(Long roomTypeId, int newCapacity, LocalDate today) {
+        return allocations.existsActiveFutureOverCapacity(roomTypeId, newCapacity, today);
+    }
+
     // ------------------------------------------------------------ mapping
     private static boolean isBlank(String s) {
         return s == null || s.isBlank();
+    }
+
+    private static boolean validZone(String zone) {
+        if (isBlank(zone)) return false;
+        try {
+            ZoneId.of(zone);
+            return true;
+        } catch (java.time.DateTimeException e) {
+            return false;
+        }
     }
 
     public static PropertyDto dto(Property p) {

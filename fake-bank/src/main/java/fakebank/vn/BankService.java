@@ -51,6 +51,7 @@ public class BankService {
         String currency = str(req, "currency");
         String payer = str(req, "payerAccount");
         if (amount.signum() <= 0) throw new BankException(HttpStatus.BAD_REQUEST, "INVALID_AMOUNT", "Số tiền phải > 0");
+        requireSimulatedAccount(payer);
         String hash = Crypto.sha256(merchant + "|" + str(req, "paymentIntentId") + "|" + amount.stripTrailingZeros().toPlainString() + "|" + currency + "|" + payer);
 
         // Cùng key + cùng payload -> trả giao dịch cũ; cùng key + khác payload -> IDEMPOTENCY_CONFLICT.
@@ -66,7 +67,6 @@ public class BankService {
         Map<String, Object> result;
         try {
             result = tx.execute(s -> {
-                if ("DB_OUTAGE".equals(scenario)) throw new IllegalStateException("Mô phỏng lỗi DB phía bank (rollback toàn bộ)");
                 // INITIATED (unique chặn hai request cùng key đồng thời)
                 jdbc.update("INSERT INTO bank_transactions (merchant_id, merchant_reference, payment_intent_id, idempotency_key, request_hash, payer_account_no, amount, currency, status, provider_txn_id, created_at, updated_at) "
                                 + "VALUES (:m, :ref, :pi, :k, :h, :p, :a, :c, 'INITIATED', :tid, :now, :now)",
@@ -104,11 +104,19 @@ public class BankService {
                 jdbc.update("UPDATE bank_transactions SET status = :s, failure_code = :f, updated_at = :now WHERE id = :id",
                         new MapSqlParameterSource("s", status).addValue("f", failure).addValue("now", Timestamp.from(now)).addValue("id", txnId));
                 enqueuePaymentWebhooks(scenario, merchant, key, providerTxnId, status, failure, amount, currency, now);
+                if ("DB_OUTAGE".equals(scenario)) {
+                    // Mô phỏng DB bank lỗi SAU khi đã ghi số dư/sổ cái/outbox: transaction rollback TOÀN BỘ -> ledger không lệch,
+                    // không có giao dịch để tra cứu, không có webhook. Client nhận 503 (không biết kết quả) -> payment UNKNOWN -> đối soát.
+                    throw new BankException(HttpStatus.SERVICE_UNAVAILABLE, "BANK_DB_UNAVAILABLE", "Mô phỏng lỗi DB phía bank (đã rollback toàn bộ)");
+                }
                 Map<String, Object> out = new LinkedHashMap<>();
                 out.put("providerTxnId", providerTxnId);
-                out.put("status", status);
+                // Kịch bản callback bất đồng bộ: bank chỉ báo ACCEPTED, kết quả cuối đến qua webhook (lặp/chậm/mất) hoặc tra cứu đối soát.
+                boolean async = "SUCCEEDED".equals(status) && ("CALLBACK_LOST".equals(scenario) || "DELAYED_CALLBACK".equals(scenario)
+                        || "DUPLICATE_CALLBACK".equals(scenario));
+                out.put("status", async ? "ACCEPTED" : status);
                 out.put("failureCode", failure);
-                out.put("amount", amount);
+                out.put("amount", amount.toPlainString());
                 out.put("currency", currency);
                 return out;
             });
@@ -134,7 +142,7 @@ public class BankService {
         p.put("providerTxnId", txnId);
         p.put("status", status);
         p.put("failureCode", failure);
-        p.put("amount", amount);
+        p.put("amount", amount.toPlainString());
         p.put("currency", currency);
         p.put("occurredAt", now.toString());
         Instant at = "DELAYED_CALLBACK".equals(scenario) ? now.plusSeconds(delayedCallbackSeconds) : now;
@@ -161,7 +169,7 @@ public class BankService {
         out.put("providerTxnId", t.get("provider_txn_id"));
         out.put("status", t.get("status"));
         out.put("failureCode", t.get("failure_code"));
-        out.put("amount", t.get("amount"));
+        out.put("amount", t.get("amount") == null ? null : ((BigDecimal) t.get("amount")).toPlainString());
         out.put("currency", t.get("currency"));
         return out;
     }
@@ -178,7 +186,9 @@ public class BankService {
         Optional<Map<String, Object>> existing = findRefund(merchant, refundKey);
         if (existing.isPresent()) {
             if (!hash.equals(existing.get().get("request_hash"))) throw new BankException(HttpStatus.CONFLICT, "IDEMPOTENCY_CONFLICT", "Cùng refundKey nhưng khác nội dung");
-            return refundView(existing.get());
+            // SUCCEEDED (hoặc đang xử lý): idempotent, không hoàn lần hai. FAILED: cho phép thử lại CÙNG refundKey (retry hữu hạn phía merchant).
+            if (!"FAILED".equals(existing.get().get("status"))) return refundView(existing.get());
+            return retryFailedRefund(merchant, refundKey, amount);
         }
         try {
             return tx.execute(s -> {
@@ -217,7 +227,7 @@ public class BankService {
                         new MapSqlParameterSource().addValue("m", merchant).addValue("k", refundKey).addValue("h", hash).addValue("t", txnId)
                                 .addValue("a", amount).addValue("s", status).addValue("f", failure).addValue("r", providerRef).addValue("now", Timestamp.from(now)));
                 Map<String, Object> p = new LinkedHashMap<>();
-                p.put("eventId", "evt-" + providerRef + "-" + status);
+                p.put("eventId", "evt-" + providerRef + "-" + status + "-1");
                 p.put("type", "REFUND_RESULT");
                 p.put("refundKey", refundKey);
                 p.put("providerRef", providerRef);
@@ -232,6 +242,64 @@ public class BankService {
             });
         } catch (DuplicateKeyException e) {
             return refundView(findRefund(merchant, refundKey).orElseThrow());
+        }
+    }
+
+    /** Thử lại một refund FAILED với cùng refundKey: khóa bản ghi, kiểm tra lại kịch bản/số dư, cập nhật trạng thái tại chỗ. */
+    private Map<String, Object> retryFailedRefund(String merchant, String refundKey, BigDecimal amount) {
+        return tx.execute(s -> {
+            Map<String, Object> r = jdbc.queryForList("SELECT * FROM bank_refunds WHERE merchant_id = :m AND refund_key = :k FOR UPDATE",
+                    new MapSqlParameterSource("m", merchant).addValue("k", refundKey)).stream().findFirst().orElseThrow();
+            if (!"FAILED".equals(r.get("status"))) return refundView(r);                  // request song song đã xử lý xong
+            Long txnId = ((Number) r.get("txn_id")).longValue();
+            Map<String, Object> t = jdbc.queryForMap("SELECT * FROM bank_transactions WHERE id = :id FOR UPDATE", new MapSqlParameterSource("id", txnId));
+            BigDecimal already = jdbc.queryForObject("SELECT COALESCE(SUM(amount),0) FROM bank_refunds WHERE txn_id = :id AND status = 'SUCCEEDED'",
+                    new MapSqlParameterSource("id", txnId), BigDecimal.class);
+            String providerRef = (String) r.get("provider_ref");
+            Instant now = Instant.now();
+            String status = "SUCCEEDED";
+            String failure = null;
+            Map<String, Object> payer = jdbc.queryForMap("SELECT * FROM bank_accounts WHERE account_no = :n", new MapSqlParameterSource("n", t.get("payer_account_no")));
+            if (already.add(amount).compareTo((BigDecimal) t.get("amount")) > 0) { status = "FAILED"; failure = "REFUND_EXCEEDED"; }
+            else if ("REFUND_FAIL".equals(payer.get("scenario"))) { status = "FAILED"; failure = "REFUND_REJECTED"; }
+            else {
+                Long merchantAcc = jdbc.queryForObject("SELECT id FROM bank_accounts WHERE merchant = TRUE ORDER BY id LIMIT 1", new MapSqlParameterSource(), Long.class);
+                Long payerId = ((Number) payer.get("id")).longValue();
+                List<Long> ids = new ArrayList<>(List.of(payerId, merchantAcc));
+                Collections.sort(ids);
+                Map<Long, BigDecimal> bal = new HashMap<>();
+                for (Long id : ids) bal.put(id, jdbc.queryForObject("SELECT balance FROM bank_accounts WHERE id = :id FOR UPDATE", new MapSqlParameterSource("id", id), BigDecimal.class));
+                if (bal.get(merchantAcc).compareTo(amount) < 0) { status = "FAILED"; failure = "MERCHANT_INSUFFICIENT"; }
+                else {
+                    jdbc.update("UPDATE bank_accounts SET balance = balance - :a, version = version + 1 WHERE id = :id", new MapSqlParameterSource("a", amount).addValue("id", merchantAcc));
+                    jdbc.update("UPDATE bank_accounts SET balance = balance + :a, version = version + 1 WHERE id = :id", new MapSqlParameterSource("a", amount).addValue("id", payerId));
+                    ledger(txnId, "REFUND", providerRef, merchantAcc, amount, BigDecimal.ZERO, now);
+                    ledger(txnId, "REFUND", providerRef, payerId, BigDecimal.ZERO, amount, now);
+                }
+            }
+            jdbc.update("UPDATE bank_refunds SET status = :s, failure_code = :f WHERE id = :id",
+                    new MapSqlParameterSource("s", status).addValue("f", failure).addValue("id", r.get("id")));
+            Map<String, Object> p = new LinkedHashMap<>();
+            // eventId mới cho mỗi lần thử (cùng providerRef) để merchant không coi kết quả lần sau là bản lặp của lần trước
+            p.put("eventId", "evt-" + providerRef + "-" + status + "-" + UUID.randomUUID().toString().substring(0, 8));
+            p.put("type", "REFUND_RESULT");
+            p.put("refundKey", refundKey);
+            p.put("providerRef", providerRef);
+            p.put("status", status);
+            p.put("failureCode", failure);
+            outbox((String) p.get("eventId"), "REFUND_RESULT", p, now);
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("providerRef", providerRef);
+            out.put("status", status);
+            out.put("failureCode", failure);
+            return out;
+        });
+    }
+
+    /** Chỉ chấp nhận tài khoản giả lập (TEST-xxx hoặc MERCHANT-xxx); chặn mọi chuỗi trông giống số thẻ/tài khoản ngân hàng thật. */
+    private static void requireSimulatedAccount(String accountNo) {
+        if (!accountNo.matches("^(TEST|MERCHANT)-[A-Z0-9-]{1,34}$") || accountNo.replaceAll("\\D", "").length() >= 9) {
+            throw new BankException(HttpStatus.BAD_REQUEST, "REAL_ACCOUNT_FORBIDDEN", "Fake Bank chỉ nhận tài khoản giả lập dạng TEST-xxx");
         }
     }
 
@@ -280,21 +348,61 @@ public class BankService {
         return jdbc.queryForList("SELECT account_no, owner_name, balance, currency, scenario, merchant FROM bank_accounts ORDER BY id", new MapSqlParameterSource());
     }
 
+    private static final Set<String> SCENARIOS = Set.of("SUCCESS", "DECLINED", "TIMEOUT_AFTER_DEBIT", "CALLBACK_LOST", "DUPLICATE_CALLBACK",
+            "DELAYED_CALLBACK", "DB_OUTAGE", "REFUND_FAIL");
+
     public void setScenario(String accountNo, String scenario) {
-        Set<String> ok = Set.of("SUCCESS", "DECLINED", "TIMEOUT_AFTER_DEBIT", "CALLBACK_LOST", "DUPLICATE_CALLBACK", "DELAYED_CALLBACK", "DB_OUTAGE", "REFUND_FAIL");
-        if (!ok.contains(scenario)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + ok);
-        jdbc.update("UPDATE bank_accounts SET scenario = :s WHERE account_no = :n", new MapSqlParameterSource("s", scenario).addValue("n", accountNo));
+        if (!SCENARIOS.contains(scenario)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + SCENARIOS);
+        int n = jdbc.update("UPDATE bank_accounts SET scenario = :s WHERE account_no = :n", new MapSqlParameterSource("s", scenario).addValue("n", accountNo));
+        if (n == 0) throw new BankException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "Không có tài khoản " + accountNo);
     }
 
     public void topUp(String accountNo, BigDecimal amount) {
         if (amount.signum() <= 0) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "amount > 0");
-        jdbc.update("UPDATE bank_accounts SET balance = balance + :a WHERE account_no = :n AND merchant = FALSE", new MapSqlParameterSource("a", amount).addValue("n", accountNo));
+        int n = jdbc.update("UPDATE bank_accounts SET balance = balance + :a WHERE account_no = :n AND merchant = FALSE", new MapSqlParameterSource("a", amount).addValue("n", accountNo));
+        if (n == 0) throw new BankException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "Không có tài khoản khách " + accountNo);
     }
 
-    /** Kiểm tra bất biến sổ cái: tổng nợ == tổng có. */
+    /** UC-35: tạo tài khoản giả lập (chỉ TEST-*), số dư và kịch bản ban đầu. */
+    public Map<String, Object> createAccount(String accountNo, String ownerName, BigDecimal balance, String scenario) {
+        requireSimulatedAccount(accountNo);
+        if (!accountNo.startsWith("TEST-")) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Tài khoản khách phải bắt đầu bằng TEST-");
+        if (balance == null || balance.signum() < 0) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "balance >= 0");
+        String sc = scenario == null || scenario.isBlank() ? "SUCCESS" : scenario;
+        if (!SCENARIOS.contains(sc)) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Kịch bản hợp lệ: " + SCENARIOS);
+        try {
+            jdbc.update("INSERT INTO bank_accounts (account_no, owner_name, balance, scenario, merchant) VALUES (:n, :o, :b, :s, FALSE)",
+                    new MapSqlParameterSource("n", accountNo).addValue("o", ownerName == null ? accountNo : ownerName).addValue("b", balance).addValue("s", sc));
+        } catch (DuplicateKeyException e) {
+            throw new BankException(HttpStatus.CONFLICT, "ACCOUNT_EXISTS", "Tài khoản đã tồn tại");
+        }
+        return Map.of("account", accountNo, "balance", balance.toPlainString(), "scenario", sc);
+    }
+
+    /**
+     * Kiểm tra bất biến sổ cái: tổng nợ == tổng có (toàn cục và theo từng giao dịch), không tài khoản nào âm,
+     * giao dịch SUCCEEDED nào cũng có bút toán, refund không vượt số tiền giao dịch.
+     */
     public Map<String, Object> ledgerCheck() {
         Map<String, Object> m = jdbc.queryForMap("SELECT COALESCE(SUM(debit),0) AS debit, COALESCE(SUM(credit),0) AS credit FROM bank_ledger_entries", new MapSqlParameterSource());
         BigDecimal d = (BigDecimal) m.get("debit"), c = (BigDecimal) m.get("credit");
-        return Map.of("totalDebit", d, "totalCredit", c, "balanced", d.compareTo(c) == 0);
+        List<Map<String, Object>> unbalanced = jdbc.queryForList("SELECT txn_id, ref_kind, ref_id, SUM(debit) AS debit, SUM(credit) AS credit FROM bank_ledger_entries "
+                + "GROUP BY txn_id, ref_kind, ref_id HAVING SUM(debit) <> SUM(credit) ORDER BY txn_id LIMIT 100", new MapSqlParameterSource());
+        Long negative = jdbc.queryForObject("SELECT COUNT(*) FROM bank_accounts WHERE balance < 0", new MapSqlParameterSource(), Long.class);
+        List<Map<String, Object>> missingEntries = jdbc.queryForList("SELECT t.provider_txn_id FROM bank_transactions t WHERE t.status = 'SUCCEEDED' "
+                + "AND NOT EXISTS (SELECT 1 FROM bank_ledger_entries l WHERE l.txn_id = t.id AND l.ref_kind = 'PAYMENT') LIMIT 100", new MapSqlParameterSource());
+        List<Map<String, Object>> overRefunded = jdbc.queryForList("SELECT t.provider_txn_id, t.amount, SUM(r.amount) AS refunded FROM bank_transactions t "
+                + "JOIN bank_refunds r ON r.txn_id = t.id AND r.status = 'SUCCEEDED' GROUP BY t.id, t.provider_txn_id, t.amount HAVING SUM(r.amount) > t.amount LIMIT 100",
+                new MapSqlParameterSource());
+        boolean ok = d.compareTo(c) == 0 && unbalanced.isEmpty() && (negative == null || negative == 0) && missingEntries.isEmpty() && overRefunded.isEmpty();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("totalDebit", d);
+        out.put("totalCredit", c);
+        out.put("balanced", ok);
+        out.put("unbalancedEntries", unbalanced);
+        out.put("negativeAccounts", negative);
+        out.put("succeededWithoutLedger", missingEntries);
+        out.put("overRefunded", overRefunded);
+        return out;
     }
 }

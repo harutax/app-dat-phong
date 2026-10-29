@@ -59,13 +59,13 @@ public class OutboxProcessor {
     public int runOnce(int max) {
         int n = 0;
         for (int i = 0; i < max; i++) {
-            Long failedId = null;
-            String err = null;
+            final Long[] current = new Long[1];
             try {
                 Boolean got = tx.execute(s -> {
                     var o = outbox.claimNext(clock.instant());
                     if (o.isEmpty()) return false;
                     OutboxEvent e = o.get();
+                    current[0] = e.getId();
                     handle(e);
                     e.setStatus(OutboxStatus.DONE);
                     e.setProcessedAt(clock.instant());
@@ -74,20 +74,20 @@ public class OutboxProcessor {
                 if (!Boolean.TRUE.equals(got)) break;
                 n++;
             } catch (Exception ex) {
-                // transaction đã rollback (kể cả notification đã tạo dở): ghi nhận lỗi + backoff trong transaction riêng
+                // transaction đã rollback (kể cả notification đã tạo dở): ghi nhận lỗi + backoff ĐÚNG event vừa lỗi trong transaction riêng
                 metrics.counter("scheduler_failures_total", "job", "outbox").increment();
-                log.warn("outbox event failed: {}", ex.getMessage());
-                err = ex.getClass().getSimpleName() + ": " + ex.getMessage();
-                markFailure(err);
+                log.warn("outbox event {} failed: {}", current[0], ex.getMessage());
+                if (current[0] != null) markFailure(current[0], ex.getClass().getSimpleName() + ": " + ex.getMessage());
                 break;
             }
         }
         return n;
     }
 
-    /** Đánh dấu lỗi cho event đầu hàng đợi vừa thất bại (event đầu có next_attempt_at nhỏ nhất). */
-    private void markFailure(String err) {
-        tx.executeWithoutResult(s -> outbox.claimNext(clock.instant()).ifPresent(e -> {
+    /** Đánh dấu lỗi cho đúng event theo id (không "claim lại event đầu hàng đợi" vì có thể là event khác do instance khác đã lấy). */
+    private void markFailure(Long eventId, String err) {
+        tx.executeWithoutResult(s -> outbox.findById(eventId).ifPresent(e -> {
+            if (e.getStatus() == OutboxStatus.DONE) return;
             e.setRetryCount(e.getRetryCount() + 1);
             e.setLastError(err == null ? null : err.substring(0, Math.min(500, err.length())));
             if (e.getRetryCount() >= MAX_RETRY) {
@@ -138,6 +138,17 @@ public class OutboxProcessor {
                 v.put("amount", String.valueOf(p.get("amount")));
                 v.put("currency", String.valueOf(p.get("currency")));
                 mail.enqueue(MailEventType.PAYMENT_FAILED, "pay" + p.get("paymentId"), b.getId(), c.getEmail(), v, null);
+            }
+            case "BOOKING_CREATED" -> {
+                // UC-09/17: khách biết đang giữ chỗ tới khi nào; HOST biết có booking chờ thanh toán ở cơ sở mình
+                Booking b = booking(p);
+                notify(e, b.getCustomerId(), "Đang giữ chỗ cho bạn", "Booking " + b.getBookingCode() + " - vui lòng thanh toán trước khi hết hạn giữ chỗ", "BOOKING", b.getId());
+                notify(e, property(b).getOwnerId(), "Có booking mới chờ thanh toán", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
+            }
+            case "REFUND_REQUESTED" -> {
+                // UC-12/13: hủy booking không đồng nghĩa hoàn tiền tức thời - báo khách yêu cầu hoàn đã được ghi nhận
+                Booking b = booking(p);
+                notify(e, b.getCustomerId(), "Đã ghi nhận yêu cầu hoàn tiền", "Booking " + b.getBookingCode() + " - tiền hoàn sẽ được xử lý qua ngân hàng", "BOOKING", b.getId());
             }
             case "BOOKING_EXPIRED" -> {
                 Booking b = booking(p);
@@ -190,6 +201,14 @@ public class OutboxProcessor {
             case "CHECKIN_REQUEST_RESPONDED" -> {
                 Booking b = booking(p);
                 notify(e, b.getCustomerId(), "Chủ cơ sở đã phản hồi giờ check-in", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
+            }
+            case "CHECKIN_REQUEST_ACCEPTED" -> {
+                Booking b = booking(p);
+                notify(e, property(b).getOwnerId(), "Khách đã đồng ý giờ check-in đề xuất", "Booking " + b.getBookingCode(), "BOOKING", b.getId());
+            }
+            case "BOOKING_NO_SHOW" -> {
+                Booking b = booking(p);
+                notify(e, b.getCustomerId(), "Booking được ghi nhận vắng mặt", "Booking " + b.getBookingCode() + " đã bị đánh dấu không đến nhận phòng", "BOOKING", b.getId());
             }
             case "COMPLAINT_CREATED" -> {
                 Booking b = booking(p);

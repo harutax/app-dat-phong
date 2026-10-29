@@ -70,7 +70,8 @@ public class BankController {
 
     // ---- admin (kịch bản lỗi, số dư giả lập) - X-Admin-Token
     private void admin(String token) {
-        if (token == null || !java.security.MessageDigest.isEqual(token.getBytes(), adminToken.getBytes())) throw new BankException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "admin token");
+        if (token == null || adminToken == null || adminToken.isBlank()
+                || !java.security.MessageDigest.isEqual(token.getBytes(java.nio.charset.StandardCharsets.UTF_8), adminToken.getBytes(java.nio.charset.StandardCharsets.UTF_8))) throw new BankException(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "admin token");
     }
 
     @GetMapping("/admin/accounts")
@@ -84,6 +85,16 @@ public class BankController {
         admin(token);
         bank.setScenario(no, value);
         return Map.of("account", no, "scenario", value);
+    }
+
+    public record NewAccount(String accountNo, String ownerName, BigDecimal balance, String scenario) {}
+
+    /** UC-35: quản trị tạo tài khoản giả lập TEST-* với số dư/kịch bản. */
+    @PostMapping("/admin/accounts")
+    public ResponseEntity<Map<String, Object>> createAccount(@RequestBody NewAccount a, @RequestHeader("X-Admin-Token") String token) {
+        admin(token);
+        if (a == null || a.accountNo() == null) throw new BankException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Thiếu accountNo");
+        return ResponseEntity.status(HttpStatus.CREATED).body(bank.createAccount(a.accountNo(), a.ownerName(), a.balance(), a.scenario()));
     }
 
     @PostMapping("/admin/accounts/{no}/topup")
@@ -101,11 +112,12 @@ public class BankController {
 
     @ExceptionHandler(BankException.class)
     public ResponseEntity<Map<String, Object>> handle(BankException e) {
-        return ResponseEntity.status(e.status).body(Map.of("code", e.code, "message", e.getMessage()));
+        return ResponseEntity.status(e.status).body(Map.of("code", e.code, "message", String.valueOf(e.getMessage())));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> unexpected(Exception e) {
+        org.slf4j.LoggerFactory.getLogger(BankController.class).error("bank internal error: {}", e.toString());
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("code", "BANK_INTERNAL_ERROR", "message", "Lỗi nội bộ phía bank"));
     }
 }

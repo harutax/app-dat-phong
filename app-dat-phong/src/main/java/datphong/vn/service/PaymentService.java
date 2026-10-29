@@ -68,6 +68,9 @@ public class PaymentService {
             var open = payments.findByBookingIdOrderByIdDesc(b.getId()).stream().filter(p -> IN_FLIGHT.contains(p.getStatus())).findFirst();
             if (open.isPresent()) return new Step1(open.get(), b, false);
 
+            if (b.getTotalAmount() == null || b.getTotalAmount().signum() <= 0) {
+                throw new BusinessException(ErrorCode.BUSINESS_RULE_VIOLATION, "Booking không có số tiền cần thanh toán");
+            }
             Payment p = new Payment();
             p.setIntentCode(Texts.code("PI", 14));
             p.setBookingId(b.getId());
@@ -85,6 +88,15 @@ public class PaymentService {
         if (!s1.created()) return dto(p, "Đã có giao dịch cho booking này");
 
         analytics.record("PAYMENT_INITIATED:" + p.getId(), "PAYMENT_INITIATED", s1.booking().getPropertyId(), "u" + customerId, String.valueOf(s1.booking().getId()), null);
+
+        // ---- bước 1b (DB, ngắn): INITIATED -> PROCESSING và COMMIT trước khi gọi bank (UC-10 / §7.2 bước 1).
+        // Nếu tiến trình chết trong lúc gọi bank, job đối soát thấy PROCESSING và hỏi bank bằng CÙNG idempotencyKey.
+        tx.executeWithoutResult(st -> payments.lockById(p.getId()).ifPresent(x -> {
+            if (x.getStatus() == PaymentStatus.INITIATED) {
+                x.setStatus(PaymentStatus.PROCESSING);
+                x.setAttempts(x.getAttempts() + 1);
+            }
+        }));
 
         // ---- bước 2: gọi Fake Bank NGOÀI transaction
         try {

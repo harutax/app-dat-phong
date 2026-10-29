@@ -37,6 +37,7 @@ import java.util.Map;
 public class ReconciliationService {
 
     private final PaymentRepository payments;
+    private final datphong.vn.repository.BookingRepository bookings;
     private final RefundRepository refunds;
     private final ReconciliationCaseRepository cases;
     private final FakeBankClient bank;
@@ -113,7 +114,7 @@ public class ReconciliationService {
             var res = bank.lookupRefund(r.getRefundKey());
             if (res.isPresent() && ("SUCCEEDED".equals(res.get().status()) || "FAILED".equals(res.get().status()))) {
                 refundService.applyResult(r.getRefundKey(), res.get().status(), res.get().providerRef(), res.get().failureCode(),
-                        "recon-refund:" + r.getRefundKey() + ":" + res.get().status());
+                        "recon-refund:" + r.getRefundKey() + ":" + r.getAttempts() + ":" + res.get().status());
             } else if (res.isEmpty()) {
                 // bank chưa nhận refund: đưa về FAILED để retry ĐÚNG refund_key cũ
                 refundService.applyResult(r.getRefundKey(), "FAILED", null, "NOT_FOUND_AT_BANK", "recon-refund-missing:" + r.getRefundKey() + ":" + r.getAttempts());
@@ -129,6 +130,47 @@ public class ReconciliationService {
         audit.attempt("REFUND_RECONCILE", "REFUND", refundId, reason, Map.of(), "ATTEMPT");
         reconcileRefund(refundId);
         audit.attempt("REFUND_RECONCILE", "REFUND", refundId, reason, Map.of(), "SUCCESS");
+    }
+
+    /** UC-36: SUPPORT yêu cầu đối soát lại một payment (hỏi bank bằng CHÍNH idempotencyKey, không debit lại). Có lý do + audit. */
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED)
+    public Map<String, Object> manualReconcilePayment(Long paymentId, String reason) {
+        Payment before = payments.findById(paymentId).orElseThrow(() -> BusinessException.notFound("Payment"));
+        audit.attempt("PAYMENT_RECONCILE", "PAYMENT", paymentId, reason, Map.of("statusBefore", before.getStatus().name()), "ATTEMPT");
+        boolean applied = reconcileOne(paymentId);
+        Payment after = payments.findById(paymentId).orElseThrow();
+        audit.attempt("PAYMENT_RECONCILE", "PAYMENT", paymentId, reason,
+                Map.of("statusBefore", before.getStatus().name(), "statusAfter", after.getStatus().name()), applied ? "SUCCESS" : "NO_CHANGE");
+        return Map.of("paymentId", paymentId, "status", after.getStatus().name(), "applied", applied);
+    }
+
+    /**
+     * UC-36: tạo refund BÙ TRỪ cho một ca đối soát đang mở (vd. UNKNOWN_PAYMENT đã được xác nhận tiền đã thu nhưng booking không thể xác nhận).
+     * refund_key ổn định theo ca ("comp-case-{id}") nên bấm lặp không hoàn hai lần; số tiền = phần còn lại chưa hoàn (không vượt captured).
+     * Thứ tự khóa: booking -> payment -> refund.
+     */
+    @Transactional
+    public CaseDto compensate(Long caseId, Long actorId, String reason) {
+        ReconciliationCase c = cases.findById(caseId).orElseThrow(() -> BusinessException.notFound("Ca đối soát"));
+        if (!"OPEN".equals(c.getStatus())) throw BusinessException.conflict("Ca đối soát đã đóng");
+        if (c.getPaymentId() == null) throw BusinessException.validation("Ca đối soát không gắn payment");
+        if (c.getBookingId() != null) bookings.lockById(c.getBookingId());                      // 1. booking
+        Payment p = payments.lockById(c.getPaymentId()).orElseThrow();                          // 2. payment
+        var existing = refunds.findByRefundKey("comp-case-" + caseId);
+        if (existing.isPresent()) return dto(c);                                                // idempotent
+        if (p.getStatus() != PaymentStatus.SUCCEEDED) {
+            throw new BusinessException(datphong.vn.exception.ErrorCode.PAYMENT_REQUIRES_REVIEW,
+                    "Payment đang " + p.getStatus() + ": hãy đối soát payment trước khi bù trừ");
+        }
+        java.math.BigDecimal remaining = p.getAmount().subtract(refunds.committedForPayment(p.getId()));
+        if (remaining.signum() <= 0) {
+            throw new BusinessException(datphong.vn.exception.ErrorCode.REFUND_AMOUNT_EXCEEDED, "Payment đã được hoàn/đang hoàn toàn bộ số tiền");
+        }
+        Refund r = refundService.request(p, remaining, "comp-case-" + caseId, "COMPENSATION:" + c.getType(), actorId);
+        c.setRefundId(r.getId());
+        audit.record("CASE_COMPENSATE", "RECON_CASE", caseId, "OPEN", "REFUND_REQUESTED", reason,
+                Map.of("refundId", r.getId(), "amount", remaining));
+        return dto(c);
     }
 
     @Transactional(readOnly = true)

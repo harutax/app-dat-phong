@@ -4,6 +4,7 @@ import jakarta.validation.constraints.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.LocalTime;
 
 public final class BookingRequests {
     private BookingRequests() {}
@@ -20,7 +21,9 @@ public final class BookingRequests {
 
     public record Cancel(@NotBlank @Size(min = 8, max = 100) String idempotencyKey, @NotBlank @Size(max = 500) String reason) {}
 
-    public record HostUpdate(@Size(max = 1000) String specialNote, @Size(max = 500) String hostNote, @NotNull Long version) {}
+    /** UC-14: HOST chỉ được sửa giờ đến dự kiến / ghi chú / yêu cầu đặc biệt; không có trường tiền hay trạng thái thanh toán. */
+    public record HostUpdate(@Size(max = 1000) String specialNote, @Size(max = 1000) String hostNote, LocalTime expectedArrivalTime,
+                             @NotNull Long version) {}
 
     public record PayInit(@NotNull Long bookingId, @NotBlank @Size(min = 8, max = 100) String idempotencyKey,
                           @NotBlank @Size(max = 40) String payerAccount) {}

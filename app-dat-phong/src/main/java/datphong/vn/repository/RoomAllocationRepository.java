@@ -23,6 +23,11 @@ public interface RoomAllocationRepository extends JpaRepository<RoomAllocation, 
     @Query(value = "select count(*) > 0 from room_allocations where room_id = :roomId and active and check_out > :today", nativeQuery = true)
     boolean existsActiveFuture(@Param("roomId") Long roomId, @Param("today") LocalDate today);
 
+    /** Allocation active tương lai của loại phòng có số khách vượt capacity mới (chặn giảm sức chứa sai). */
+    @Query(value = "select count(*) > 0 from room_allocations a join bookings b on b.id = a.booking_id "
+            + "where a.active and a.check_out > :today and b.room_type_id = :roomTypeId and b.guest_count > :capacity", nativeQuery = true)
+    boolean existsActiveFutureOverCapacity(@Param("roomTypeId") Long roomTypeId, @Param("capacity") int capacity, @Param("today") LocalDate today);
+
     /** Giải phóng ĐÚNG MỘT LẦN: UPDATE có điều kiện active = true; trả số hàng đã đổi (0 nếu đã giải phóng). */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("update RoomAllocation a set a.active = false, a.releasedAt = :now where a.bookingId = :bookingId and a.active = true")

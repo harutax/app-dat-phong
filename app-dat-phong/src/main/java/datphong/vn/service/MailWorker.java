@@ -108,7 +108,7 @@ public class MailWorker {
 
     private void deliver(Long id) {
         MailEvent m = mails.findById(id).orElseThrow();
-        EmailTemplateVersion v = versions.findById(m.getTemplateVersionId()).orElse(null);
+        EmailTemplateVersion v = m.getTemplateVersionId() == null ? null : versions.findById(m.getTemplateVersionId()).orElse(null);
         if (v == null) { finish(id, MailStatus.FAILED_VALIDATION, "NO_TEMPLATE", null); return; }
 
         TemplateRenderer.Rendered r;

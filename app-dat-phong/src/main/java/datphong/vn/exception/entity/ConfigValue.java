@@ -24,6 +24,9 @@ public class ConfigValue {
     private String scopeId = "";
     @Column(name = "cfg_value", nullable = false, length = 500)
     private String value;
+    /** Giá trị đang hiệu lực trước khi value (lên lịch ở tương lai) có hiệu lực; null = dùng default. */
+    @Column(name = "previous_value", length = 500)
+    private String previousValue;
     @Column(name = "effective_at", nullable = false)
     private Instant effectiveAt;
     @Column(nullable = false)

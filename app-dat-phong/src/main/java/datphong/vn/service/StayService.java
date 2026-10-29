@@ -16,6 +16,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -57,12 +59,19 @@ public class StayService {
         if (b.getStatus() != BookingStatus.CONFIRMED && b.getStatus() != BookingStatus.CHECKED_IN) {
             throw BusinessException.conflict("Chỉ cập nhật yêu cầu cho booking đang hiệu lực");
         }
-        // CHỈ các trường được phép: ghi chú. Không có đường nào sửa tiền / paymentStatus / số đêm.
-        if (req.specialNote() != null) b.setSpecialNote(req.specialNote());
+        // CHỈ các trường được phép: giờ đến / ghi chú / yêu cầu đặc biệt. Không có đường nào sửa tiền / paymentStatus / số đêm.
+        List<String> changed = new ArrayList<>();
+        if (req.specialNote() != null) { b.setSpecialNote(req.specialNote()); changed.add("specialNote"); }
+        if (req.hostNote() != null) { b.setHostNote(req.hostNote()); changed.add("hostNote"); }
+        if (req.expectedArrivalTime() != null) { b.setExpectedArrivalTime(req.expectedArrivalTime()); changed.add("expectedArrivalTime"); }
+        if (changed.isEmpty()) throw BusinessException.validation("Không có trường nào được cập nhật");
         bookings.saveAndFlush(b);
-        audit.record("HOST_BOOKING_UPDATE", "BOOKING", bookingId, null, null, req.hostNote(), Map.of("fields", "specialNote"));
-        outbox.publish("HOST_BOOKING_UPDATED:" + bookingId + ":" + (b.getVersion() + 1), "HOST_BOOKING_UPDATED", "BOOKING", bookingId,
-                Map.of("bookingId", bookingId));
+        audit.record("HOST_BOOKING_UPDATE", "BOOKING", bookingId, null, null, null, Map.of("fields", changed));
+        // Thông báo cho khách chỉ khi thay đổi khách nhìn thấy (ghi chú nội bộ của HOST không gửi đi)
+        if (changed.contains("specialNote") || changed.contains("expectedArrivalTime")) {
+            outbox.publish("HOST_BOOKING_UPDATED:" + bookingId + ":" + b.getVersion(), "HOST_BOOKING_UPDATED", "BOOKING", bookingId,
+                    Map.of("bookingId", bookingId));
+        }
     }
 
     @Transactional
@@ -117,6 +126,33 @@ public class StayService {
         transitions.release(bookingId);
         reminders.cancelForBooking(bookingId);
         checkinRequests.closeOpenForBooking(bookingId);
+        outbox.publish("BOOKING_NO_SHOW:" + bookingId, "BOOKING_NO_SHOW", "BOOKING", bookingId, Map.of("bookingId", bookingId));
         audit.record("BOOKING_NO_SHOW", "BOOKING", bookingId, "CONFIRMED", "NO_SHOW", reason, null);
+    }
+
+    /**
+     * UC-15 luồng ngoại lệ: check-out khi booking CHƯA check-in (khách đã ở nhưng lễ tân quên check-in, sự cố hệ thống...).
+     * Chỉ SUPPORT có quyền SUPPORT_STAY_EXCEPTION, bắt buộc lý do, có audit. Đi qua state machine bình thường
+     * (CONFIRMED -> CHECKED_IN -> COMPLETED) với actor SUPPORT; actual_check_in giữ null để phân biệt với check-in thật.
+     * Không thay đổi tổng tiền đã xác nhận. Request lặp không cập nhật hai lần.
+     */
+    @Transactional
+    public void supportForceCheckout(Long supportId, Long bookingId, String reason) {
+        if (reason == null || reason.isBlank()) throw BusinessException.validation("Cần nêu lý do xử lý ngoại lệ");
+        Booking b = bookings.lockById(bookingId).orElseThrow(() -> BusinessException.notFound("Booking"));
+        if (b.getStatus() == BookingStatus.COMPLETED) return;
+        if (b.getStatus() != BookingStatus.CONFIRMED && b.getStatus() != BookingStatus.CHECKED_IN) {
+            throw new BusinessException(ErrorCode.CHECKIN_NOT_ALLOWED, "Booking " + b.getStatus() + " không thể check-out ngoại lệ");
+        }
+        String from = b.getStatus().name();
+        if (b.getStatus() == BookingStatus.CONFIRMED) {
+            transitions.to(b, BookingStatus.CHECKED_IN, "SUPPORT", supportId, "Ngoại lệ (không có check-in thực tế): " + reason);
+        }
+        transitions.to(b, BookingStatus.COMPLETED, "SUPPORT", supportId, "Check-out ngoại lệ: " + reason);
+        b.setActualCheckOut(clock.instant());
+        reminders.cancelForBooking(bookingId);
+        checkinRequests.closeOpenForBooking(bookingId);
+        outbox.publish("BOOKING_COMPLETED:" + bookingId, "BOOKING_COMPLETED", "BOOKING", bookingId, Map.of("bookingId", bookingId));
+        audit.record("SUPPORT_FORCE_CHECKOUT", "BOOKING", bookingId, from, "COMPLETED", reason, null);
     }
 }

@@ -57,6 +57,10 @@ public class SearchService {
         if (f.guests() < 1 || f.guests() > 50) throw BusinessException.validation("Số khách không hợp lệ");
         if (f.size() < 1 || f.size() > 50) throw BusinessException.validation("size tối đa 50");
         if (f.page() < 0 || f.page() > 1000) throw BusinessException.validation("page không hợp lệ");
+        // UC-07: sort chỉ nhận giá trị trong whitelist; giá trị lạ là lỗi đầu vào, không âm thầm đổi sang mặc định
+        if (f.sort() != null && !f.sort().isBlank() && !SORTS.containsKey(f.sort())) {
+            throw BusinessException.validation("sort phải là một trong " + new java.util.TreeSet<>(SORTS.keySet()));
+        }
         if (f.minPrice() != null && f.maxPrice() != null && f.minPrice().compareTo(f.maxPrice()) > 0) throw BusinessException.validation("Khoảng giá không hợp lệ");
         if (f.amenities() != null && f.amenities().size() > 12) throw BusinessException.validation("Quá nhiều bộ lọc tiện ích");
     }

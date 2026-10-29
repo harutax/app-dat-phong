@@ -9,6 +9,7 @@ import lombok.Setter;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
 
 /**
  * Đơn đặt phòng. Giá (booking_nights) và chính sách hủy (free_cancel_deadline, penalty_percent)
@@ -72,6 +73,12 @@ public class Booking extends BaseEntity {
     private Instant actualCheckOut;
     @Column(name = "special_note", length = 1000)
     private String specialNote;
+    /** UC-14/29: giờ đến dự kiến (giờ địa phương của cơ sở) do HOST/khách thống nhất. */
+    @Column(name = "expected_arrival_time")
+    private LocalTime expectedArrivalTime;
+    /** UC-14: ghi chú nội bộ của HOST - chỉ HOST/SUPPORT xem, không trả cho khách. */
+    @Column(name = "host_note", length = 1000)
+    private String hostNote;
     @Column(name = "source_channel", nullable = false, length = 30)
     private String sourceChannel = "WEB";
     @Version

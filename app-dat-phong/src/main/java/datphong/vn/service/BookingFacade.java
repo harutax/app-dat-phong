@@ -7,7 +7,6 @@ import datphong.vn.exception.ErrorCode;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.stereotype.Service;
@@ -34,7 +33,9 @@ public class BookingFacade {
     public record Outcome(datphong.vn.dto.response.BookingResponses.BookingDto booking, boolean replayed) {}
 
     public Outcome create(Long customerId, BookingRequests.Create req) {
-        String hash = HmacSigner.sha256Hex(req.roomId() + "|" + req.checkIn() + "|" + req.checkOut() + "|" + req.guestCount());
+        // requestHash phủ toàn bộ nội dung đặt phòng (kể cả ghi chú): cùng key + khác payload -> IDEMPOTENCY_CONFLICT (UC-09)
+        String hash = HmacSigner.sha256Hex(req.roomId() + "|" + req.checkIn() + "|" + req.checkOut() + "|" + req.guestCount()
+                + "|" + (req.specialNote() == null ? "" : req.specialNote().trim()));
         String scope = "booking:create:" + customerId;
         RuntimeException last = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -45,7 +46,7 @@ public class BookingFacade {
                             String.valueOf(r.booking().getId()), null);
                 }
                 return new Outcome(queries.customerView(customerId, r.booking().getId()), r.replayed());
-            } catch (CannotAcquireLockException | PessimisticLockingFailureException e) {
+            } catch (PessimisticLockingFailureException e) {
                 last = e;
                 metrics.counter("booking_lock_retry_total").increment();
                 log.warn("booking lock contention attempt {}/{}", attempt, MAX_ATTEMPTS);
