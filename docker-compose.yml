@@ -63,8 +63,9 @@ services:
       start_period: 10s
 
   # Tao bucket mot lan roi thoat.
+  # Dung lai image minio/minio (co san lenh mc): minio/mc khong con pull duoc tu Docker Hub.
   minio-init:
-    image: minio/mc:latest
+    image: minio/minio:latest
     container_name: datphong-minio-init
     restart: "no"
     depends_on:

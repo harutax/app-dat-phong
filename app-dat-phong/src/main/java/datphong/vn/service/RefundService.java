@@ -100,7 +100,10 @@ public class RefundService {
             FakeBankClient.BankRefund res = bank.refund(ctx.key(), ctx.providerTxnId(), ctx.amount(), ctx.currency(), ctx.reason());
             if ("SUCCEEDED".equals(res.status()) || "FAILED".equals(res.status())) {
                 // eventId gắn số lần thử: kết quả FAILED của lần retry sau KHÔNG bị coi là bản lặp của lần trước (nếu không refund kẹt PROCESSING mãi)
-                applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(), "sync-refund:" + ctx.key() + ":" + ctx.attempt() + ":" + res.status());
+                // Gọi nội bộ (this.applyResult) KHÔNG đi qua proxy nên @Transactional bị bỏ qua -> phải tự mở transaction,
+                // nếu không lock booking/payment/refund ném "Query requires transaction" và kết quả đồng bộ bị mất.
+                tx.executeWithoutResult(s -> applyResult(ctx.key(), res.status(), res.providerRef(), res.failureCode(),
+                        "sync-refund:" + ctx.key() + ":" + ctx.attempt() + ":" + res.status()));
             }
             // PROCESSING/ACCEPTED: chờ webhook hoặc đối soát
         } catch (FakeBankClient.BankUnknownException e) {

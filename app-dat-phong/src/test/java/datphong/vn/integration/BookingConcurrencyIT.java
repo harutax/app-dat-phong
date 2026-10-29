@@ -188,8 +188,9 @@ class BookingConcurrencyIT {
         var b = facade.create(c, req("price-key-12345")).booking();
         assertEquals(0, new BigDecimal("1800000").compareTo(b.totalAmount()), "500k+600k+700k, đêm trả phòng không tính");
         assertEquals(3, b.nights().size());
-        // client gửi sai tổng tiền -> PRICE_CHANGED
-        var wrong = new BookingRequests.Create(roomId, in.plusDays(1), in.plusDays(2), 2, "price-key-99999", new BigDecimal("1"), null, null);
+        // client gửi sai tổng tiền -> PRICE_CHANGED. Dùng khoảng KHÔNG giao booking trên: kiểm tra chồng lấn chạy trước
+        // kiểm tra giá (UC-09), nên khoảng giao nhau sẽ ra ROOM_UNAVAILABLE thay vì PRICE_CHANGED.
+        var wrong = new BookingRequests.Create(roomId, out, out.plusDays(1), 2, "price-key-99999", new BigDecimal("1"), null, null);
         assertEquals(ErrorCode.PRICE_CHANGED, assertThrows(BusinessException.class, () -> facade.create(c, wrong)).getCode());
     }
 
